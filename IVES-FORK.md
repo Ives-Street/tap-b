@@ -262,6 +262,19 @@ pooled, i.e. exactly backwards. The line now reads
 `Initialization done in W s (C s CPU)`, wall clock first; their ratio is achieved
 parallelism.
 
+### 9. `src/bush.c` — warm-start marker line
+
+A `<WARM START>` run that silently falls back to a cold bush build produces the
+same equilibrium and shows up only as lost minutes — invisible in the results,
+exactly the shape of failure the preload and pooled-init markers exist for. The
+warm-start branch of `initializeAlgorithmB` now prints
+`Warm start: bushes loaded from <file>` at `LOW_NOTIFICATIONS` after
+`readBushes` returns, so a caller can assert the warm start actually engaged
+rather than infer it from initialisation time. (`readBushes` itself only
+validates the stored batch size, not the network topology — a caller feeding it
+bushes from a different network of the same origin count gets undefined
+behaviour, so callers must key stored bushes on the network they came from.)
+
 ## Not upstreamed (yet)
 
 The pooled `bushSPTT`, the pooled bush init, the `SRCS`/`SOURCES` Makefile bug,

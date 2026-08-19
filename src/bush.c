@@ -248,7 +248,13 @@ void initializeAlgorithmB(network_type *network, bushes_type **bushes,
         if (parameters->warmStart == TRUE) { /* Read file and rectify */
             displayMessage(FULL_NOTIFICATIONS, "Reading batch %d\n", batch);
             readBushes(network, bushes, batchFileName);
-            displayMessage(FULL_NOTIFICATIONS, "Read batch %d\n", batch);
+            /* IVES FORK: prove-it-fired marker, like the preload and pooled-
+             * init lines.  A warm start that silently fell back to a cold
+             * build is invisible in the results (same equilibrium) and shows
+             * up only as lost minutes, so callers grep for this line. */
+            displayMessage(LOW_NOTIFICATIONS,
+                           "Warm start: bushes loaded from %s\n",
+                           batchFileName);
         } else { /* No warm start, have to re-initialize */
             /* Do we have to create a bush from scratch, or can we reuse
              * the first? */
