@@ -35,6 +35,11 @@ struct thread_args {
 
 void updateBushPool(void* pVoid);
 void updateFlowsPool(void* pVoid);
+/* IVES FORK: pooled initial-bush construction (see initializeBushesB) */
+void initBushPool(void* pVoid);
+void initialBushShortestPath_par(int origin, network_type *network,
+                                 bushes_type *bushes,
+                                 algorithmBParameters_type *parameters);
 
 /* Parallized main Algorithm B helper functions */
 void updateBushB_par(int origin, network_type *network, bushes_type *bushes,

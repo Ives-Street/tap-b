@@ -119,15 +119,39 @@ double linkCost(arc_type *arc, cost_type costFunction) {
 }
 
 /*
+ * IVES FORK: effectiveFlow -- the flow the link performance function sees.
+ *
+ * Assigned flow plus the fixed background preload (arc->preload; see
+ * networks.h).  On any network without a <PRELOAD FILE> the preload is zero
+ * and every function below reduces to its upstream form exactly.
+ *
+ * The derivative functions need no chain-rule factor: d(x + p)/dx = 1, so
+ * t'(x + p) is already the derivative with respect to the assigned flow that
+ * Newton's method shifts.
+ *
+ * The integral functions are the one place preload is not a substitution.
+ * Beckmann's objective integrates the link performance function over the
+ * *assigned* flow with the preload held fixed:
+ *     int_0^x t(p + w) dw = T(p + x) - T(p),
+ * where T is the antiderivative -- not T(p + x), and not T(x).  Each
+ * xxxBPRint below is written in that difference form; at p = 0 the subtracted
+ * term vanishes and the expression is upstream's.
+ */
+static inline double effectiveFlow(struct arc_type *arc) {
+    return arc->flow + arc->preload;
+}
+
+/*
  * generalBPRcost -- Evaluates the BPR function for an arbitrary polynomial.
  */
 double generalBPRcost(struct arc_type *arc) {
-   if (arc->flow <= 0)
+   double flow = effectiveFlow(arc);
+   if (flow <= 0)
    // Protect against negative flow values and 0^0 errors
        return arc->freeFlowTime + arc->fixedCost;
 
    return arc->fixedCost + arc->freeFlowTime *
-       (1 + arc->alpha * pow(arc->flow / arc->capacity, arc->beta));
+       (1 + arc->alpha * pow(flow / arc->capacity, arc->beta));
 }
 
 /*
@@ -135,7 +159,8 @@ double generalBPRcost(struct arc_type *arc) {
  * function.
  */
 double generalBPRder(struct arc_type *arc) {
-   if (arc->flow <= 0) { /* Protect against negative flow values and 0^0
+   double flow = effectiveFlow(arc);
+   if (flow <= 0) { /* Protect against negative flow values and 0^0
                             errors */
       if (arc->beta != 1)
          return 0;
@@ -143,59 +168,67 @@ double generalBPRder(struct arc_type *arc) {
          return arc->freeFlowTime * arc->alpha / arc->capacity;
    }
     return arc->freeFlowTime * arc->alpha * arc->beta / arc->capacity
-              * pow(arc->flow / arc->capacity, arc->beta - 1);
+              * pow(flow / arc->capacity, arc->beta - 1);
 }
 
 /*
  * generalBPRint -- Evaluate integral of an arbitrary polynomial BPR function.
  */
 double generalBPRint(struct arc_type *arc, bool includeFixedCost) {
-   if (arc->flow <= 0) return 0; /* Protect against negative flow values and 
+   if (arc->flow <= 0) return 0; /* Protect against negative flow values and
                                     0^0 errors */
-   return arc->flow * (includeFixedCost == TRUE ? arc->fixedCost : 0
-           + arc->freeFlowTime * 
-           (1 + arc->alpha / (arc->beta + 1) * 
-            pow(arc->flow / arc->capacity, arc->beta)));
+   double p = arc->preload, x = arc->flow;
+   double congestion = pow((p + x) / arc->capacity, arc->beta) * (p + x)
+                     - (p > 0 ? pow(p / arc->capacity, arc->beta) * p : 0);
+   return (includeFixedCost == TRUE ? arc->fixedCost * x : 0)
+           + arc->freeFlowTime *
+             (x + arc->alpha / (arc->beta + 1) * congestion);
 }
 
 /* linearBPRcost/der/int -- Faster implementation for linear BPR functions. */
 double linearBPRcost(struct arc_type *arc) {
    return arc->fixedCost + arc->freeFlowTime *
-       (1 + arc->alpha * arc->flow / arc->capacity);
+       (1 + arc->alpha * effectiveFlow(arc) / arc->capacity);
 }
 
 double linearBPRder(struct arc_type *arc) {
+   /* Constant in flow, so the preload does not appear. */
    return arc->freeFlowTime * arc->alpha / arc->capacity;
 }
 
 double linearBPRint(struct arc_type *arc, bool includeFixedCost) {
-   return arc->flow * (includeFixedCost == TRUE ? arc->fixedCost : 0
-           + arc->freeFlowTime * (1 + arc->flow*arc->alpha/arc->capacity/2));
+   double p = arc->preload, x = arc->flow;
+   return (includeFixedCost == TRUE ? arc->fixedCost * x : 0)
+           + arc->freeFlowTime * x
+             * (1 + arc->alpha * (p + x / 2) / arc->capacity);
 }
 
 /* quarticBPRcost/der/int -- Faster implementation for 4th-power BPR functions
  */
 double quarticBPRcost(struct arc_type *arc) {
-   double y = arc->flow / arc->capacity;
+   double y = effectiveFlow(arc) / arc->capacity;
    y *= y;
    y *= y;
    return arc->fixedCost + arc->freeFlowTime * (1 + arc->alpha * y);
 }
 
 double quarticBPRder(struct arc_type *arc) {
-   double y = arc->flow / arc->capacity / arc->capacity;
+   double flow = effectiveFlow(arc);
+   double y = flow / arc->capacity / arc->capacity;
    y *= y;
-   y *= arc->flow;
+   y *= flow;
    return 4 * arc->freeFlowTime * arc->alpha * y;
 
 }
 
 double quarticBPRint(struct arc_type *arc, bool includeFixedCost) {
-   double y = arc->flow / arc->capacity;
-   y *= y;
-   y *= y;
-   return arc->flow * (includeFixedCost == TRUE ? arc->fixedCost : 0
-           + arc->freeFlowTime * (1 + arc->alpha * y / 5));
+   double p = arc->preload, x = arc->flow;
+   double yx = (p + x) / arc->capacity, yp = p / arc->capacity;
+   yx *= yx; yx *= yx;          /* ((p+x)/cap)^4 */
+   yp *= yp; yp *= yp;          /* (p/cap)^4     */
+   return (includeFixedCost == TRUE ? arc->fixedCost * x : 0)
+           + arc->freeFlowTime *
+             (x + arc->alpha * (yx * (p + x) - yp * p) / 5);
 }
 
 double conicCost(struct arc_type *arc) {
@@ -488,6 +521,8 @@ void makeStronglyConnectedNetwork(network_type *network) {
             newArcVector[i].alpha = 0;
             newArcVector[i].beta = 1;
             newArcVector[i].flow = 0;
+            newArcVector[i].preload = 0; /* IVES FORK: artificial arcs carry
+                                            no background flow */
             newArcVector[i].capacity = ARTIFICIAL;
             newArcVector[i].length = ARTIFICIAL;
             newArcVector[i].freeFlowTime = ARTIFICIAL;
@@ -513,6 +548,8 @@ void makeStronglyConnectedNetwork(network_type *network) {
             newArcVector[i].alpha = 0;
             newArcVector[i].beta = 1;
             newArcVector[i].flow = 0;
+            newArcVector[i].preload = 0; /* IVES FORK: artificial arcs carry
+                                            no background flow */
             newArcVector[i].capacity = ARTIFICIAL;
             newArcVector[i].length = ARTIFICIAL;
             newArcVector[i].freeFlowTime = ARTIFICIAL;

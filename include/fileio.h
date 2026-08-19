@@ -43,6 +43,8 @@ void writeBinaryMatrices(network_type *network, char *matrixStem);
 void readOBANetwork(network_type *network, char *linkFileName,
                     char **tripFileName, int numClasses,
                     double defaultDemandMultiplier);
+/* IVES FORK: per-link fixed background flow, <PRELOAD FILE> */
+void readPreloadFile(network_type *network, char *preloadFileName);
 void setBatches(network_type *network, int batchSize, bool warmStart,
                 bool storeMatrices, char *matrixStem);
 void writeOBANetwork(network_type *Network, char *linkfile, char *tripfile);

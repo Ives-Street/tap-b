@@ -40,6 +40,15 @@ typedef struct arc_type {
     int    tail;
     int    head;
     double  flow;
+    /* IVES FORK: fixed background flow on this link (trucks, external-through
+       traffic) that congests it but belongs to no OD matrix and never
+       reroutes.  Zero everywhere unless a <PRELOAD FILE> is supplied, which
+       makes every expression that reads it identical to upstream.  It enters
+       the link performance function and its derivative -- see effectiveFlow()
+       in tap.c -- and *only* there: flow conservation, bush flows, TSTT and
+       the demand side of SPTT all keep seeing assigned flow alone, which is
+       what makes the relative gap the gap of the preloaded problem. */
+    double  preload;
     double* classFlow; /* [class] */
     double* classCost; /* [class]... fixed costs per class */
     double* classToll; /* [class]... separate from classCost to get revenue  */

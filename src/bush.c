@@ -41,8 +41,19 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
 
     /* Initialize */
     clock_t stopTime = clock(); /* used for timing */
+    /* IVES FORK: clock() is processor time summed over threads, so once
+     * initialization is pooled it *rises* while the run gets faster -- it is
+     * the wrong instrument for judging the parallel init, and reads as a
+     * regression.  Report wall clock first (the number anyone timing a run
+     * means) and keep CPU time beside it; their ratio is achieved parallelism. */
+    struct timespec initTick, initTock;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &initTick);
     initializeAlgorithmB(network, &bushes, parameters);
-    displayMessage(LOW_NOTIFICATIONS, "Initialization done in %.3f s.\n",
+    clock_gettime(CLOCK_MONOTONIC_RAW, &initTock);
+    displayMessage(LOW_NOTIFICATIONS,
+        "Initialization done in %.3f s (%.3f s CPU).\n",
+        (double)(initTock.tv_sec - initTick.tv_sec)
+            + (initTock.tv_nsec - initTick.tv_nsec) / 1e9,
         ((double)(clock() - stopTime)) / CLOCKS_PER_SEC);
     if(parameters->calculateBeckmann == TRUE)
         displayMessage(DEBUG, "Initial Beckmann: %f\n", BeckmannFunction(network));
@@ -178,6 +189,7 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
      * loop, defeating the pooled fast path below.  Default OFF here; turn back
      * on with <CALCULATE BINS> in the parameters file. */
     parameters.calculateBins = FALSE;
+    parameters.serialBushInit = FALSE; /* IVES FORK */
     parameters.numBins = 70;
     parameters.smallestBin = -60;
     parameters.includedBin = NULL;
@@ -257,9 +269,19 @@ void initializeAlgorithmB(network_type *network, bushes_type **bushes,
             for (ij = 0; ij < network->numArcs; ij++) {
                 network->arcs[ij].flow += (*bushes)->flow[ij];
                 network->arcs[ij].classFlow[c] += (*bushes)->flow[ij];
-                network->arcs[ij].cost =
-                    network->arcs[ij].calculateCost(&network->arcs[ij]);
             }
+        }
+        /* IVES FORK: the cost update used to sit inside the origin loop above,
+         * so every arc's performance function was evaluated once per origin --
+         * numOrigins x numArcs pow() calls (3.5e8 on a Washington DC network)
+         * of which only the last pass survives.  calculateCost is a pure
+         * function of the arc's own flow and parameters, and nothing in
+         * rectifyBushFlows reads arc costs, so evaluating it once after the
+         * loop leaves exactly the same values behind.  (Same reason the
+         * derivative pass below is already outside the batch loop.) */
+        for (ij = 0; ij < network->numArcs; ij++) {
+            network->arcs[ij].cost =
+                network->arcs[ij].calculateCost(&network->arcs[ij]);
         }
         snprintf(batchFileName, 2*STRING_SIZE, "%s%d.bin",
                  parameters->batchStem, batch);
@@ -929,6 +951,59 @@ void deleteBushes(network_type *network, bushes_type *bushes) {
 void initializeBushesB(network_type *network, bushes_type *bushes,
                        algorithmBParameters_type *parameters) {
     int c, origin, lastClass = IS_MISSING;
+
+#ifdef PARALLELISM
+    /* IVES FORK: pooled initial-bush construction.
+     *
+     * The loop below is a serial per-origin shortest-path tree build, while the
+     * update phase it feeds is fully pooled.  On a Washington DC network (1,814
+     * origins, ~85k nodes, ~195k arcs) it was measured at 14.8 minutes -- paid
+     * once per cold start, i.e. once per scenario entry and after every
+     * topology-changing mutation.  Each origin's work is independent once the
+     * shared SPcost scratch is replaced by the per-origin SPcost_par row (see
+     * initialBushShortestPath_par), so dispatch it through the existing pool in
+     * the same shape updateBatchBushes uses.
+     *
+     * The fast path is taken only where it is provably the same computation:
+     *
+     *  - numClasses == 1, so the changeFixedCosts sequencing the serial loop
+     *    performs collapses to the single hoisted call below.  (With one class
+     *    the serial loop calls it exactly once too, at origin 0, because
+     *    lastClass starts at IS_MISSING.)
+     *  - the two function pointers are the stock implementations, which are the
+     *    ones audited for per-origin independence.  A future createInitialBush
+     *    or topologicalOrder gets the serial loop until someone checks it.
+     *
+     * Anything else falls through to the untouched loop.  Serial builds never
+     * see this block.
+     */
+    if (parameters->serialBushInit == FALSE
+            && network->numClasses == 1
+            && parameters->createInitialBush == &initialBushShortestPath
+            && parameters->topologicalOrder == &genericTopologicalOrder) {
+        struct thread_args *args =
+            newVector(network->batchSize, struct thread_args);
+        int nQueued = 0;
+        changeFixedCosts(network, 0);
+        for (origin = 0; origin < network->batchSize; origin++) {
+            if (outOfOrigins(network, origin) == TRUE) break;
+            args[origin].id = origin;
+            args[origin].network = network;
+            args[origin].bushes = bushes;
+            args[origin].parameters = parameters;
+            args[origin].update_flows_ret = FALSE;
+            thpool_add_work(thpool, (void (*)(void *)) initBushPool,
+                            (void *) &args[origin]);
+            nQueued++;
+        }
+        thpool_wait(thpool);
+        deleteVector(args);
+        /* prove-it-fired line: absent from a log means the serial loop ran */
+        displayMessage(LOW_NOTIFICATIONS,
+                       "Parallel bush init engaged (%d origins)\n", nQueued);
+        return;
+    }
+#endif
 
     for (origin = 0; origin < network->batchSize; origin++) {
         if (outOfOrigins(network, origin) == TRUE) break;

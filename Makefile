@@ -73,6 +73,22 @@ debug: $(BINDIR)/$(PROJECT)
 profile: CFLAGS += $(PROFILEFLAGS)
 profile: $(BINDIR)/$(PROJECT)
 
+# ---------- test target (IVES FORK) ----------------
+# Direct checks on the preloaded link performance functions; see
+# test/bpr_preload_test.c for why these cannot be proven by a solve.
+
+.PHONY: test
+test: $(BINDIR)/bpr_preload_test
+	$(BINDIR)/bpr_preload_test
+
+$(BINDIR)/bpr_preload_test: test/bpr_preload_test.c $(OBJDIR)/tap.o \
+                            $(OBJDIR)/networks.o $(OBJDIR)/datastructures.o \
+                            $(OBJDIR)/utils.o $(OBJDIR)/bush.o \
+                            $(OBJDIR)/parallel_bush.o $(OBJDIR)/fileio.o \
+                            $(OBJDIR)/convexcombination.o $(OBJDIR)/thpool.o
+	$(CC) -std=gnu17 -pthread -Wall $(INCLUDEFLAG) -DPARALLELISM=1 -O2 \
+	    $^ -lm -o $@
+
 # ---------- compile objects
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c $(DEPDIR)/%.d
@@ -99,6 +115,13 @@ remove: clean
 $(DEPDIR)/%.d: ;
 .PRECIOUS: $(DEPDIR)/%.d
 
-include $(wildcard $(patsubst %,$(DEPDIR)/%.d,$(basename $(SRCS))))
+# IVES FORK: this was $(SRCS), a variable that is never defined -- so the
+# generated .d files were written and then never included, and an incremental
+# build ignored header changes entirely.  Editing networks.h (which is where
+# arc_type lives) recompiled only the .c files touched in the same edit and
+# linked them against objects still using the *old* struct layout: a binary that
+# reads every arc field at the wrong offset and segfaults somewhere unrelated.
+# The fix is one word; the symptom was expensive.
+include $(wildcard $(patsubst %,$(DEPDIR)/%.d,$(basename $(notdir $(SOURCES)))))
 
 

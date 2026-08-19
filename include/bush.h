@@ -271,6 +271,10 @@ typedef struct algorithmBParameters_type{
    bool     reuseFirstBush;
    bool     includeGapTime;
    bool     calculateBins;
+   /* IVES FORK: force the stock serial initial-bush loop in a parallel build.
+      Exists so the pooled initializeBushesB can be compared against the code it
+      replaces with one variable changed -- <SERIAL BUSH INIT>. */
+   bool     serialBushInit;
    int      numBins;
    int      smallestBin;
    int      *includedBin;

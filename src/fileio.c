@@ -14,6 +14,7 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
 	char fullLine[STRING_SIZE * 2]; // Double-length to allow concatenation
 	char filePath[STRING_SIZE], dataPath[STRING_SIZE];
 	char networkFileName[STRING_SIZE];
+	char preloadFileName[STRING_SIZE]; /* IVES FORK */
 	stringList_type *tripsFile = NULL, *newTripsFile = NULL;
 	char metadataTag[STRING_SIZE], metadataValue[STRING_SIZE];
 	FILE *parametersFile = openFile(filename, "r");
@@ -29,6 +30,7 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
        thisRun when it was created.  These default values are not repeated
        here. */
     networkFileName[0] = '\0';
+    preloadFileName[0] = '\0'; /* IVES FORK: optional, absent means no preload */
     strcpy(filePath, "net/");
     strcpy(dataPath, "net/");
     strcpy(thisRun->flowsFile, "flows.txt");
@@ -42,6 +44,10 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
 		} while (status == BLANK_LINE || status == COMMENT);
 		if        (strcmp(metadataTag, "NETWORK FILE") == 0) {
 			strcpy(networkFileName, metadataValue);
+		} else if (strcmp(metadataTag, "PRELOAD FILE") == 0) {
+            /* IVES FORK: per-link fixed background flow (see
+               readPreloadFile).  Optional; absent means no preload. */
+			strcpy(preloadFileName, metadataValue);
 		} else if (strcmp(metadataTag, "TRIPS FILE") == 0) {
 			newTripsFile = newScalar(stringList_type);
             strcpy(newTripsFile->string, metadataValue);
@@ -151,6 +157,11 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
              * (upstream defaults them on).  Switching them on also forces the
              * serial bushSPTT loop -- the bins need per-origin arc scans. */
             thisRun->calculateBins = TRUE;
+		} else if (strcmp(metadataTag, "SERIAL BUSH INIT") == 0) {
+            /* IVES FORK: run the stock serial initial-bush loop even in a
+               parallel build, so the pooled version can be compared against
+               the code it replaces. */
+            thisRun->serialBushInit = TRUE;
 		} else if (strcmp(metadataTag, "INITIAL BUSH") == 0) {
 			if    (strcmp(metadataValue, "SP_TREE") == 0)
 				thisRun->createInitialBush = &initialBushShortestPath;
@@ -218,6 +229,14 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
     /* garbage collection */
     readOBANetwork(network, networkFileName, tripsFiles, network->numClasses,
                    thisRun->demandMultiplier);
+    /* IVES FORK: background preload, if any.  After the network is read (the
+       rows are matched against its arcs) and before AlgorithmB adds artificial
+       arcs. */
+    if (strlen(preloadFileName) > 0) {
+        snprintf(fullLine, 2*STRING_SIZE, "%s%s", filePath, preloadFileName);
+        mystrncpy(preloadFileName, fullLine, STRING_SIZE - 1);
+        readPreloadFile(network, preloadFileName);
+    }
     if (thisRun->storeMatrices == TRUE) {
         writeBinaryMatrices(network, thisRun->matrixStem);
     }
@@ -414,6 +433,9 @@ void readOBANetwork(network_type *network, char *linkFileName,
         network->arcs[i].tail--;
         network->arcs[i].head--;
         network->arcs[i].flow = 0;
+        /* IVES FORK: no background flow unless a <PRELOAD FILE> supplies it.
+           newVector is malloc, not calloc, so this has to be explicit. */
+        network->arcs[i].preload = 0;
         network->arcs[i].cost = network->arcs[i].freeFlowTime;
         if (network->arcs[i].beta == 1) {
            network->arcs[i].calculateCost = &linearBPRcost;
@@ -531,6 +553,111 @@ void readOBANetwork(network_type *network, char *linkFileName,
     displayMessage(FULL_NOTIFICATIONS, "Forward and reverse star lists "
             "generated.\n");
 
+}
+
+/*
+ * IVES FORK: readPreloadFile -- per-link fixed background flow.
+ *
+ * Reads a file of the form
+ *
+ *     <NUMBER OF LINKS> 4916
+ *     <END OF METADATA>
+ *     ~ Init Term Preload ;
+ *     1 2 12.5 ;
+ *     ...
+ *
+ * with exactly one data row per link, in the same order as the network file.
+ * The row's (tail, head) is *verified* against the arc it lands on rather than
+ * trusted: a preload file written for a different network, or shifted by one
+ * row, would otherwise put background traffic on the wrong links and produce a
+ * perfectly converged answer to the wrong problem.  Keying on (tail, head)
+ * instead of position is not an option -- real networks carry genuine parallel
+ * arcs between the same node pair -- so the format is positional and the pair
+ * is the check, not the key.
+ *
+ * Must be called after readOBANetwork and before makeStronglyConnectedNetwork,
+ * i.e. while numArcs is still the real link count.  Artificial arcs get
+ * preload 0 where they are created (tap.c).
+ */
+void readPreloadFile(network_type *network, char *preloadFileName) {
+    int i, tail, head, numParams, status, statedLinks = IS_MISSING;
+    int nonzero = 0;
+    double preload, total = 0;
+    char fullLine[STRING_SIZE], trimmedLine[STRING_SIZE];
+    char metadataTag[STRING_SIZE], metadataValue[STRING_SIZE];
+    FILE *preloadFile = openFile(preloadFileName, "r");
+
+    bool endofMetadata = FALSE;
+    do {
+        if (fgets(fullLine, STRING_SIZE, preloadFile) == NULL)
+            fatalError("Preload file %s ended (or other I/O error) before "
+                       "metadata complete.", preloadFileName);
+        status = parseMetadata(fullLine, metadataTag, metadataValue);
+        if (status == BLANK_LINE || status == COMMENT) continue;
+        if        (strcmp(metadataTag, "NUMBER OF LINKS") == 0) {
+            statedLinks = atoi(metadataValue);
+        } else if (strcmp(metadataTag, "END OF METADATA") == 0) {
+            endofMetadata = TRUE;
+        } else {
+            warning(MEDIUM_NOTIFICATIONS, "Ignoring unknown metadata tag %s "
+                    "in preload file %s", metadataTag, preloadFileName);
+        }
+    } while (endofMetadata == FALSE);
+
+    if (statedLinks == IS_MISSING)
+        fatalError("Preload file %s does not state the number of links.",
+                   preloadFileName);
+    if (statedLinks != network->numArcs)
+        fatalError("Preload file %s covers %d links but the network has %d. "
+                   "The preload is positional -- it must be written for this "
+                   "network.", preloadFileName, statedLinks, network->numArcs);
+
+    for (i = 0; i < network->numArcs; i++) {
+        if (fgets(fullLine, STRING_SIZE, preloadFile) == NULL)
+            fatalError("Preload file %s ended (or other I/O error) after %d of "
+                       "%d links.", preloadFileName, i, network->numArcs);
+        status = parseLine(fullLine, trimmedLine);
+        if (status == BLANK_LINE || status == COMMENT) {
+            i--;
+            continue;
+        }
+        numParams = sscanf(trimmedLine, "%d %d %lf", &tail, &head, &preload);
+        if (numParams != 3)
+            fatalError("Preload file %s has an error in this line:\n\"%s\"",
+                       preloadFileName, fullLine);
+        if (tail - 1 != network->arcs[i].tail
+                || head - 1 != network->arcs[i].head)
+            fatalError("Preload file %s is misaligned with the network at row "
+                       "%d: the file has (%d,%d), the network has (%d,%d). "
+                       "Preload rows must be in network-file link order.",
+                       preloadFileName, i + 1, tail, head,
+                       network->arcs[i].tail + 1, network->arcs[i].head + 1);
+        if (preload < 0)
+            fatalError("Negative preload %f on link (%d,%d) in %s.", preload,
+                       tail, head, preloadFileName);
+        /* The preload enters the link performance function, so it is only
+           meaningful for the performance functions that were taught about it
+           (the three BPR variants in tap.c).  Refuse rather than ignore. */
+        if (preload > 0
+                && network->arcs[i].calculateCost != &linearBPRcost
+                && network->arcs[i].calculateCost != &quarticBPRcost
+                && network->arcs[i].calculateCost != &generalBPRcost)
+            fatalError("Link (%d,%d) carries preload %f but does not use a BPR "
+                       "performance function; preload is only implemented for "
+                       "BPR.", tail, head, preload);
+        network->arcs[i].preload = preload;
+        if (preload > 0) {
+            nonzero++;
+            total += preload;
+        }
+    }
+    fclose(preloadFile);
+
+    /* Prove-it-fired line, in the same spirit as the pooled-SPTT marker: the
+       absence of this from a log means no background flow was loaded. */
+    displayMessage(LOW_NOTIFICATIONS,
+                   "Preload loaded: %d of %d links carrying background flow, "
+                   "%.6g veh total.\n", nonzero, network->numArcs, total);
 }
 
 /*

@@ -660,6 +660,47 @@ void classUpdate_par(int hi, int class, double shift,  network_type *network) {
     pthread_mutex_lock(&network->arc_muts[hi]);
 }
 
+/*
+ * IVES FORK: initialBushShortestPath_par -- the per-origin half of the pooled
+ * initializeBushesB (bush.c).  Identical to initialBushShortestPath except that
+ * the shortest-path labels go into this origin's own SPcost_par row rather than
+ * the single shared bushes->SPcost scratch vector, which is the only thing
+ * standing between the stock loop and independence.  Everything else it writes
+ * -- pred[origin], bushOrder[origin], numMerges[origin], lastMerge[origin] --
+ * is already per-origin upstream, and arcIndexBellmanFord allocates its own
+ * queue and reads the network read-only.
+ *
+ * The serial version dumps every node and arc at DEBUG before dying on a
+ * disconnected bush.  From a worker thread that dump would be interleaved
+ * nonsense, so this one names the origin and the unreachable node instead;
+ * rerun with <NUMBER OF THREADS> 1 for upstream's full diagnostic.
+ */
+void initialBushShortestPath_par(int origin, network_type *network,
+                                 bushes_type *bushes,
+                                 algorithmBParameters_type *parameters) {
+    int ij, originNode = origin2node(network, origin);
+
+    arcIndexBellmanFord(originNode, bushes->SPcost_par[origin],
+                        bushes->pred[origin], network,
+                        parameters->SPQueueDiscipline);
+    for (ij = 0; ij < network->numNodes; ij++) {
+        if (ij != originNode && bushes->pred[origin][ij] == IS_MISSING) {
+            fatalError("Cannot find initial connected bush for origin %d "
+                       "(node %d unreachable).", origin + 1, ij + 1);
+        }
+    }
+
+    bushes->numMerges[origin] = 0;
+    parameters->topologicalOrder(origin, network, bushes, parameters);
+}
+
+void initBushPool(void* pVoid) {
+    struct thread_args *args = (struct thread_args *) pVoid;
+    initialBushShortestPath_par(args->id, args->network, args->bushes,
+                                args->parameters);
+    calculateBushFlows_par(args->id, args->network, args->bushes);
+}
+
 void updateBushPool(void* pVoid) {
     struct thread_args *args = (struct thread_args *) pVoid;
     int id = args->id;
