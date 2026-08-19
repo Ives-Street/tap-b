@@ -172,7 +172,12 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
     parameters.includeGapTime = TRUE;
 
     parameters.updateBushScanType = LONGEST_USED_OR_SP;
-    parameters.calculateBins = TRUE;
+    /* IVES FORK: reduced-cost bins are diagnostic-only (they feed nothing but
+     * DEBUG display in bushSPTT), but computing them is O(origins x arcs) and
+     * their upstream TRUE default routes bushSPTT down the serial per-origin
+     * loop, defeating the pooled fast path below.  Default OFF here; turn back
+     * on with <CALCULATE BINS> in the parameters file. */
+    parameters.calculateBins = FALSE;
     parameters.numBins = 70;
     parameters.smallestBin = -60;
     parameters.includedBin = NULL;
@@ -588,7 +593,40 @@ bool isInBush(int origin, int ij, network_type *network, bushes_type *bushes) {
  * CUSTOM GAP ROUTINES *
  ***********************/
 
-/* 
+#ifdef PARALLELISM
+/* IVES FORK: pooled per-origin SPTT.  The stock bushSPTT loop is a
+ * serial scan + Bellman-Ford per origin; at 1,814 origins x 85k nodes it was
+ * measured at ~35 min per gap evaluation while the iteration's actual work
+ * took 14-52 s.  Each origin's work is independent (scanBushes_par +
+ * BellmanFord_NoLabel write only that origin's SPcost_par row; the queue is
+ * function-local), so dispatch it through the existing pool exactly like
+ * updateBatchBushes does.  Single-class, bins-off fast path only; anything
+ * else falls through to the stock serial loop. */
+typedef struct {
+    int origin;
+    network_type *network;
+    bushes_type *bushes;
+    algorithmBParameters_type *parameters;
+    double sptt;
+} spttArgs_type;
+
+static void bushSPTTPool(void *pVoid) {
+    spttArgs_type *a = (spttArgs_type *) pVoid;
+    int r = a->origin, j;
+    network_type *network = a->network;
+    bushes_type *bushes = a->bushes;
+    scanBushes_par(r, network, bushes, a->parameters, NO_LONGEST_PATH);
+    BellmanFord_NoLabel(origin2node(network, r), bushes->SPcost_par[r],
+                        network, DEQUE, bushes->SPcost_par[r],
+                        bushes->bushOrder[r]);
+    a->sptt = 0;
+    for (j = 0; j < network->numZones; j++) {
+        a->sptt += network->demand[r][j] * bushes->SPcost_par[r][j];
+    }
+}
+#endif
+
+/*
  * bushSPTT -- specialized SPTT finding using bush structures as a warm start
  *
  * This function is also where reduced-cost bins are updated, because we
@@ -598,6 +636,31 @@ double bushSPTT(network_type *network, bushes_type *bushes,
               algorithmBParameters_type *parameters) {
     int b, r, ij, i, j, c, lastClass = IS_MISSING, originNode;
     double frac, rc, acceptanceGap = 0, rejectionGap = INFINITY, consistency;
+#ifdef PARALLELISM
+    if (parameters->calculateBins == FALSE && network->numClasses == 1) {
+        double psptt = 0;
+        spttArgs_type *args = newVector(network->batchSize, spttArgs_type);
+        int nQueued = 0;
+        for (r = 0; r < network->batchSize; r++) {
+            if (outOfOrigins(network, r) == TRUE) break;
+            args[r].origin = r;
+            args[r].network = network;
+            args[r].bushes = bushes;
+            args[r].parameters = parameters;
+            args[r].sptt = 0;
+            thpool_add_work(thpool, (void (*)(void *)) bushSPTTPool,
+                            (void *) &args[r]);
+            nQueued++;
+        }
+        thpool_wait(thpool);
+        for (r = 0; r < nQueued; r++) psptt += args[r].sptt;
+        deleteVector(args);
+        /* prove-it-fired line: absent from a log means the serial loop ran */
+        displayMessage(LOW_NOTIFICATIONS,
+                       "Parallel SPTT path engaged (%d origins)\n", nQueued);
+        return psptt;
+    }
+#endif
     double sptt = 0;
     if (parameters->calculateBins == TRUE) {
         for (b = 0; b < parameters->numBins; b++) {

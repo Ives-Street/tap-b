@@ -19,7 +19,10 @@ OBJECTS := $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 RM = rm -f
 
 CC = gcc
-CFLAGS = -pthread -Wall $(INCLUDEFLAG) $(DEPFLAGS)
+# IVES FORK: gcc 15 defaults to C23, where `bool` is a keyword and utils.h's own
+# typedef becomes a hard error in every translation unit.  Pin the dialect the
+# source was written for.
+CFLAGS = -std=gnu17 -pthread -Wall $(INCLUDEFLAG) $(DEPFLAGS)
 CFLAGS += -Wextra -Wwrite-strings -Wno-parentheses -Winline
 CFLAGS += -Wpedantic -Warray-bounds
 CFLAGS += -DPARALLELISM=1 # Parallel is now default; use make serial if unwanted

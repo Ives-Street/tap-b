@@ -1,5 +1,9 @@
 # TAP-B
 
+> **This is [Ives Street](https://ives.st)'s fork.** Base commit, patches, and
+> rationale are documented in [`IVES-FORK.md`](IVES-FORK.md). Upstream is
+> [spartalab/tap-b](https://github.com/spartalab/tap-b).
+
 Fast, efficient C implementation of algorithms for the traffic assignment problem.
 Default solution method is Algorithm B, developed by Robert Dial.
 Link-based solution methods (MSA, Frank-Wolfe, conjugate and biconjugate Frank-Wolfe) are also provided.

@@ -146,6 +146,11 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
             thisRun->reuseFirstBush = TRUE;
 		} else if (strcmp(metadataTag, "EXCLUDE GAP TIME") == 0) {
             thisRun->includeGapTime = FALSE;
+		} else if (strcmp(metadataTag, "CALCULATE BINS") == 0) {
+            /* IVES FORK: reduced-cost bin diagnostics, off by default here
+             * (upstream defaults them on).  Switching them on also forces the
+             * serial bushSPTT loop -- the bins need per-origin arc scans. */
+            thisRun->calculateBins = TRUE;
 		} else if (strcmp(metadataTag, "INITIAL BUSH") == 0) {
 			if    (strcmp(metadataValue, "SP_TREE") == 0)
 				thisRun->createInitialBush = &initialBushShortestPath;
