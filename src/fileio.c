@@ -152,6 +152,12 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
             thisRun->reuseFirstBush = TRUE;
 		} else if (strcmp(metadataTag, "EXCLUDE GAP TIME") == 0) {
             thisRun->includeGapTime = FALSE;
+		} else if (strcmp(metadataTag, "GAP TIMING") == 0) {
+            /* IVES FORK: cx-cold-solve-cost instrumentation.  Times bushSPTT
+             * and TSTT/bushTSTT separately and reports page-fault/RSS deltas
+             * per iteration -- see the block comment on gapTiming in
+             * bush.h. */
+            thisRun->gapTiming = TRUE;
 		} else if (strcmp(metadataTag, "CALCULATE BINS") == 0) {
             /* IVES FORK: reduced-cost bin diagnostics, off by default here
              * (upstream defaults them on).  Switching them on also forces the

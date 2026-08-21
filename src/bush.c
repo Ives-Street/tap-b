@@ -6,6 +6,7 @@
  * bushes.
  */
 #include "bush.h"
+#include <sys/resource.h> /* IVES FORK: <GAP TIMING> -- getrusage */
 
 /* Include this declarations hear to avoid nested header includes */
 #if PARALLELISM
@@ -389,7 +390,34 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
                                     + tock.tv_nsec - tick.tv_nsec)) * 1.0/1e9;
             stopTime = clock(); /* Exclude gap calculations from run time */
             displayMessage(DEBUG, "Calculating batch gap...\n");
+            /* IVES FORK: <GAP TIMING>.  Total wall time for the gap
+             * calculation plus page-fault/RSS deltas, to separate genuine
+             * per-origin algorithmic cost (H1) from memory pressure (H2) --
+             * see cx-cold-solve-cost's brief.  getrusage(RUSAGE_SELF, ...)
+             * sums all threads in the process on Linux, so this also covers
+             * bushSPTT's pooled workers. */
+            struct timespec gapTick, gapTock;
+            struct rusage ruBefore, ruAfter;
+            if (parameters->gapTiming) {
+                clock_gettime(CLOCK_MONOTONIC_RAW, &gapTick);
+                getrusage(RUSAGE_SELF, &ruBefore);
+            }
             batchGap = bushRelativeGap(network, bushes, parameters);
+            if (parameters->gapTiming) {
+                clock_gettime(CLOCK_MONOTONIC_RAW, &gapTock);
+                getrusage(RUSAGE_SELF, &ruAfter);
+                displayMessage(LOW_NOTIFICATIONS,
+                    "GAP TIMING iter %d: total %.3f s (SPTT %.3f s, "
+                    "TSTT %.3f s), minflt %ld majflt %ld this iter, "
+                    "maxrss %ld KB\n",
+                    iteration,
+                    (double)(gapTock.tv_sec - gapTick.tv_sec)
+                        + (gapTock.tv_nsec - gapTick.tv_nsec) / 1e9,
+                    parameters->gapSPTTTime, parameters->gapTSTTTime,
+                    ruAfter.ru_minflt - ruBefore.ru_minflt,
+                    ruAfter.ru_majflt - ruBefore.ru_majflt,
+                    ruAfter.ru_maxrss);
+            }
             displayMessage(DEBUG, "Calculated batch gap...\n");
             gap += batchGap;
             if (parameters->calculateEntropy == TRUE) {
@@ -495,6 +523,9 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
     parameters.SPQueueDiscipline = DEQUE;
     
     parameters.includeGapTime = TRUE;
+    parameters.gapTiming = FALSE; /* IVES FORK: <GAP TIMING> */
+    parameters.gapSPTTTime = 0;
+    parameters.gapTSTTTime = 0;
 
     /* IVES FORK: full LP labels, not upstream's LONGEST_USED_OR_SP.  The
      * add/preserve guards in updateBushB compare LPcost across nodes, which
@@ -1143,11 +1174,29 @@ double bushTSTT(network_type *network, bushes_type *bushes) {
 
 double bushRelativeGap(network_type *network, bushes_type *bushes,
                      algorithmBParameters_type *parameters) {
-    
+
+    /* IVES FORK: <GAP TIMING>.  bushSPTT and TSTT/bushTSTT are timed
+     * separately so the two can be told apart in the untimed residual --
+     * see cx-cold-solve-cost's brief.  clock_gettime(CLOCK_MONOTONIC_RAW,...)
+     * per the fork's existing convention (clock() is CPU time summed across
+     * threads and reads backwards once a phase is pooled). */
+    struct timespec sT0, sT1, tT0, tT1;
+    if (parameters->gapTiming) clock_gettime(CLOCK_MONOTONIC_RAW, &sT0);
     double sptt = bushSPTT(network, bushes, parameters);
+    if (parameters->gapTiming) {
+        clock_gettime(CLOCK_MONOTONIC_RAW, &sT1);
+        parameters->gapSPTTTime = (double)(sT1.tv_sec - sT0.tv_sec)
+            + (sT1.tv_nsec - sT0.tv_nsec) / 1e9;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &tT0);
+    }
     double tstt = network->numBatches == 1 ?
                                          TSTT(network) :
                                          bushTSTT(network, bushes);
+    if (parameters->gapTiming) {
+        clock_gettime(CLOCK_MONOTONIC_RAW, &tT1);
+        parameters->gapTSTTTime = (double)(tT1.tv_sec - tT0.tv_sec)
+            + (tT1.tv_nsec - tT0.tv_nsec) / 1e9;
+    }
     displayMessage(DEBUG, "Current relative gap:\nCurrent TSTT: %f\nShortest "
                           "path TSTT: %f\n", tstt, sptt);
     /* if (tstt < sptt) warning(LOW_NOTIFICATIONS, "Negative gap.  TSTT and "

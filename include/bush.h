@@ -249,6 +249,19 @@ typedef struct bushes_type {
  *
  *  includeGapTime -- include gap calculation time in run times?  Default TRUE
  *
+ *  gapTiming -- IVES FORK: instrumentation for cx-cold-solve-cost.  When TRUE,
+ *               wraps bushRelativeGap's two components (bushSPTT and
+ *               TSTT/bushTSTT) in clock_gettime(CLOCK_MONOTONIC_RAW, ...)
+ *               timers and reports both, plus page-fault and RSS deltas for
+ *               the whole gap calculation, on one line per iteration at
+ *               LOW_NOTIFICATIONS.  Exists because the fork's own iteration
+ *               timer (elapsedTime) deliberately excludes gap calculation
+ *               (see the comment at its call site), so nothing previously
+ *               measured what that time is spent on.  Off by default --
+ *               getrusage/clock_gettime calls are cheap but this is a
+ *               diagnostic, not something a normal run should pay for.
+ *               <GAP TIMING> turns it on.
+ *
  *  batchStem -- prefix for files storing batches of bushes in binary format.
  *               Default = "batch", so files are batch0.bin, batch1.bin, etc.
  *  matrixStem -- prefix for files storing binary OD matrices for each batch.
@@ -294,6 +307,11 @@ typedef struct algorithmBParameters_type{
    bool     storeBushes;
    bool     reuseFirstBush;
    bool     includeGapTime;
+   bool     gapTiming;    /* IVES FORK, see block comment above */
+   double   gapSPTTTime;  /* IVES FORK: wall seconds, set by bushRelativeGap
+                              when gapTiming is TRUE; read back at the call
+                              site to print alongside the iteration number. */
+   double   gapTSTTTime;  /* IVES FORK: same, for TSTT/bushTSTT. */
    bool     calculateBins;
    /* IVES FORK: force the stock serial initial-bush loop in a parallel build.
       Exists so the pooled initializeBushesB can be compared against the code it
