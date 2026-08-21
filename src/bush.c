@@ -1017,6 +1017,31 @@ bool isInBush(int origin, int ij, network_type *network, bushes_type *bushes) {
  ***********************/
 
 #ifdef PARALLELISM
+/* IVES FORK: <GAP TIMING> queue-discipline switch for the pooled SPTT's
+ * Bellman-Ford.  Session 4 measured DC sweeping its whole 198,584-arc network
+ * 737 times per origin per iteration against Charleston's 1.62, at an
+ * identical cost per arc scan -- so the blowup is work volume, and the
+ * suspect is Pape's deque (DEQUE), whose front-requeue rule has a known
+ * exponential worst case.  Plain Bellman-Ford-Moore (FIFO) is O(nm).  This
+ * lets one binary run both arms; the default is DEQUE, so with the
+ * environment variable unset nothing changes. */
+static queueDiscipline sptQueue = DEQUE;
+static const char *sptQueueName = "DEQUE";
+
+static void readSPTQueueDiscipline(void) {
+    static bool alreadyRead = FALSE;
+    const char *env;
+    if (alreadyRead == TRUE) return;  /* called serially from bushSPTT */
+    alreadyRead = TRUE;
+    env = getenv("TAPB_SPTT_QUEUE");
+    if (env == NULL) return;
+    if (strcmp(env, "FIFO") == 0) { sptQueue = FIFO; sptQueueName = "FIFO"; }
+    else if (strcmp(env, "LIFO") == 0) { sptQueue = LIFO; sptQueueName="LIFO"; }
+    else if (strcmp(env, "DEQUE") == 0) { sptQueue = DEQUE; }
+    else fatalError("TAPB_SPTT_QUEUE must be FIFO, LIFO, or DEQUE, not '%s'",
+                    env);
+}
+
 /* IVES FORK: pooled per-origin SPTT.  The stock bushSPTT loop is a
  * serial scan + Bellman-Ford per origin; at 1,814 origins x 85k nodes it was
  * measured at ~35 min per gap evaluation while the iteration's actual work
@@ -1054,7 +1079,7 @@ static void bushSPTTPool(void *pVoid) {
     scanBushes_par(r, network, bushes, a->parameters, NO_LONGEST_PATH);
     if (timing) clock_gettime(CLOCK_MONOTONIC_RAW, &s1);
     BellmanFord_NoLabel(origin2node(network, r), bushes->SPcost_par[r],
-                        network, DEQUE, bushes->SPcost_par[r],
+                        network, sptQueue, bushes->SPcost_par[r],
                         bushes->bushOrder[r]);
     if (timing) {
         clock_gettime(CLOCK_MONOTONIC_RAW, &b1);
@@ -1085,6 +1110,7 @@ double bushSPTT(network_type *network, bushes_type *bushes,
         double psptt = 0;
         spttArgs_type *args = newVector(network->batchSize, spttArgs_type);
         int nQueued = 0;
+        readSPTQueueDiscipline(); /* serial, before any worker reads sptQueue */
         for (r = 0; r < network->batchSize; r++) {
             if (outOfOrigins(network, r) == TRUE) break;
             args[r].origin = r;
@@ -1113,9 +1139,12 @@ double bushSPTT(network_type *network, bushes_type *bushes,
             }
         }
         deleteVector(args);
-        /* prove-it-fired line: absent from a log means the serial loop ran */
+        /* prove-it-fired line: absent from a log means the serial loop ran.
+         * The queue name is printed here rather than assumed from the
+         * environment, so a log records which arm actually ran. */
         displayMessage(LOW_NOTIFICATIONS,
-                       "Parallel SPTT path engaged (%d origins)\n", nQueued);
+                       "Parallel SPTT path engaged (%d origins, queue %s)\n",
+                       nQueued, sptQueueName);
         return psptt;
     }
 #endif
