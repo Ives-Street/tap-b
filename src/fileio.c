@@ -162,6 +162,33 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
                parallel build, so the pooled version can be compared against
                the code it replaces. */
             thisRun->serialBushInit = TRUE;
+		} else if (strcmp(metadataTag, "UPDATE BUSH SCAN") == 0) {
+            /* IVES FORK: the scan type was previously not settable from a
+               parameters file.  Exposed so the pre-F2 behaviour
+               (LONGEST_USED_OR_SP) stays reachable for A/B without a
+               rebuild; see IVES-FORK.md section 10 before using it -- the
+               non-default scans leave LP labels on mixed scales, which is
+               the condition that produced the DC cycle crash. */
+			if    (strcmp(metadataValue, "LONGEST_BUSH_PATH") == 0)
+				thisRun->updateBushScanType = LONGEST_BUSH_PATH;
+			else if (strcmp(metadataValue, "LONGEST_USED_PATH") == 0)
+				thisRun->updateBushScanType = LONGEST_USED_PATH;
+			else if (strcmp(metadataValue, "LONGEST_USED_OR_SP") == 0)
+				thisRun->updateBushScanType = LONGEST_USED_OR_SP;
+			else if (strcmp(metadataValue, "NO_LONGEST_PATH") == 0)
+				thisRun->updateBushScanType = NO_LONGEST_PATH;
+			else
+				fatalError("Unknown bush scan type %s\n", metadataValue);
+		} else if (strcmp(metadataTag, "LOOSE CRITERION") == 0) {
+            /* IVES FORK: fallback loose link-add criterion, decoupled from
+               the scan type (upstream ties it to LONGEST_BUSH_PATH, which
+               hard-stalls SiouxFalls).  Off unless this tag is present. */
+            thisRun->useLooseCriterion = TRUE;
+		} else if (strcmp(metadataTag, "SELFTEST INJECT CYCLE") == 0) {
+            /* IVES FORK: test hook -- inject a genuine two-cycle into a bush
+               so the topological order fails and the cycle dump runs.
+               Breaks the solve by design. */
+            thisRun->selftestInjectCycle = TRUE;
 		} else if (strcmp(metadataTag, "INITIAL BUSH") == 0) {
 			if    (strcmp(metadataValue, "SP_TREE") == 0)
 				thisRun->createInitialBush = &initialBushShortestPath;

@@ -83,6 +83,8 @@ void updateBushB_par(int origin, network_type *network, bushes_type *bushes,
 
     int ij, i, j, newArcs = 0;
 
+    diagResetNewArcs(); /* IVES F1 DIAGNOSTIC */
+
     /* First update labels... ignoring longest unused paths since those will be
      * removed in the next step. */
     calculateBushFlows_par(origin, network, bushes);
@@ -109,6 +111,7 @@ void updateBushB_par(int origin, network_type *network, bushes_type *bushes,
                 || network->arcs[ij].tail >= network->firstThroughNode))
         {
             bushes->flow_par[origin][ij] = NEW_LINK;
+            diagRecordNewArc(ij, 1); /* IVES F1 DIAGNOSTIC */
             newArcs++;
             /* Never delete shortest path tree... should be OK with floating point
              * comparison since this is how SPcost is calculated */
@@ -116,11 +119,15 @@ void updateBushB_par(int origin, network_type *network, bushes_type *bushes,
                    && bushes->flow_par[origin][ij] == 0
                    && isInBush(origin, ij, network, bushes) == TRUE) {
             bushes->flow_par[origin][ij] = NEW_LINK;
+            diagRecordNewArc(ij, 2); /* IVES F1 DIAGNOSTIC */
         }
     }
 
-    /* If strict criterion fails, try a looser one */
-    if (newArcs == 0 && parameters->updateBushScanType == LONGEST_BUSH_PATH) {
+    /* If strict criterion fails, try a looser one.  IVES FORK: gated on its
+     * own parameter, not on updateBushScanType == LONGEST_BUSH_PATH as
+     * upstream has it -- that coupling hard-stalls SiouxFalls now that the
+     * full-LP scan is the default (IVES-FORK.md section 10). */
+    if (newArcs == 0 && parameters->useLooseCriterion == TRUE) {
         for (ij = 0; ij < network->numArcs; ij++) {
             i = network->arcs[ij].tail;
             j = network->arcs[ij].head;
@@ -131,9 +138,20 @@ void updateBushB_par(int origin, network_type *network, bushes_type *bushes,
                     || network->arcs[ij].tail >= network->firstThroughNode))
             {
                 bushes->flow_par[origin][ij] = NEW_LINK;
+                diagRecordNewArc(ij, 3); /* IVES F1 DIAGNOSTIC */
             }
         }
     }
+
+    /* IVES FORK test hook, self-test only.  With <SELFTEST INJECT CYCLE> in
+     * the parameters file, deliberately close a two-cycle in this bush by
+     * adding the reverse of an in-bush arc.  reconstructMerges accepts it (it
+     * only requires each non-origin node to have >= 1 incoming contributing
+     * link), so genericTopologicalOrder then fails exactly as it does on the
+     * DC crash -- which is what exercises diagReportCycle end to end on a
+     * small network.  Never enabled by a normal run. */
+    if (parameters->selftestInjectCycle == TRUE)
+        diagInjectTwoCycle(origin, network, bushes);
 
     /* Finally update bush data structures: delete/add merges, find a new
      * topological order, rectify approach proportions */

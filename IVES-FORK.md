@@ -5,10 +5,12 @@ vendored for use as a bush-based user-equilibrium engine inside
 [Connectome](https://github.com/Ives-Street/connectome)'s Stage 3.5 traffic
 assignment. Upstream is MIT-licensed; so is this fork.
 
-Nothing here changes the algorithm. The patches are two build fixes, three
-performance fixes, the parameters that make the switchable ones switchable, and
-one genuine feature — a per-link fixed background flow that upstream has no way
-to express.
+Almost nothing here changes the algorithm. The patches are two build fixes,
+three performance fixes, the parameters that make the switchable ones
+switchable, one genuine feature — a per-link fixed background flow that
+upstream has no way to express — and one correctness fix (section 10): the
+default bush-update scan is `LONGEST_BUSH_PATH`, because the upstream default
+can build a cyclic bush and crash.
 
 **Base commit:** `040135a20c771fbb84766df6a97cff981fa5df4b` (upstream `master`,
 2024-09-22). **Our branch:** `ives/main`. Upstream stays as the `upstream`
@@ -275,12 +277,105 @@ validates the stored batch size, not the network topology — a caller feeding i
 bushes from a different network of the same origin count gets undefined
 behaviour, so callers must key stored bushes on the network they came from.)
 
+### 10. `src/bush.c`, `src/parallel_bush.c`, `src/fileio.c` — full LP labels by default, loose criterion decoupled
+
+The one correctness fix, and the only patch that changes the algorithm's
+default behaviour. Upstream's default `updateBushScanType` is
+`LONGEST_USED_OR_SP`, under which `updateBushB` can build a **cyclic bush** and
+die in `genericTopologicalOrder` with `Graph given to bushTopologicalOrder
+contains a cycle`. We hit this reproducibly on a Washington DC network
+(1,814 origins × 195k arcs, preloaded): three independent runs, three different
+reporting origins, the same 70 unorderable nodes.
+
+**The mechanism.** All three add/preserve branches in `updateBushB` justify
+themselves through LP labels. The strict criterion's `LPcost[i] < LPcost[j]`
+guard excludes cycles only if LP order is a topological order of the *whole*
+bush — i.e. only if every bush arc constrains `LPcost`. Under
+`LONGEST_USED_OR_SP`, a node with no longest-*used* path falls back to its SP
+label, so LP labels on different nodes sit on different scales and comparing
+them means nothing. The hole is widest in the shortest-path-tree re-add branch
+(preserve an in-bush zero-flow arc on SP equality), which tests **nothing about
+LP order at all**: in the DC crash it preserved an arc running backwards in LP
+(70.3366 → 64.2778), and the strict criterion then closed an 8-arc cycle
+through it under a valid-looking guard. With `LONGEST_BUSH_PATH` every bush arc
+constrains `LPcost`, LP order is a genuine topological order, and all three
+branches become sound at once.
+
+Upstream has been here twice — `topcyclebug` (c946e08) commented the loose
+fallback criterion out entirely over an "updateBush Cycle issue", and
+`updatebushcycle` (7ceb5c0) re-gated it on
+`newArcs == 0 && updateBushScanType == LONGEST_BUSH_PATH` — closing the
+soundness condition on one branch while leaving it open on the other two.
+
+**Why the loose criterion is decoupled rather than left riding on the scan
+type.** Upstream's gate makes switching to `LONGEST_BUSH_PATH` *silently
+activate* the loose criterion, and that combination **hard-stalls SiouxFalls**:
+gap pinned at exactly 2.1100e-3 from iteration ~20 onward, identical shift
+count every iteration, no progress. So the obvious one-line fix — flip the
+default scan type — walks into a convergence failure through a gate that looks
+like a safety condition. The loose criterion now hangs on its own parameter,
+`useLooseCriterion`, default off; changing the scan type moves nothing else.
+A future reader who "simplifies" this back onto the scan type re-introduces
+the stall.
+
+**Cost of the fix,** one thread, deterministic, `<CONVERGENCE GAP> 1e-4` —
+iteration counts and final gaps, old default → new default:
+
+| network | `LONGEST_USED_OR_SP` | `LONGEST_BUSH_PATH` |
+|---|---|---|
+| SiouxFalls | 6 iters, 6.6e-5 | 7 iters, 5.1e-5 |
+| Anaheim | 3 iters, 2.0e-5 | 4 iters, 8.0e-5 |
+| ChicagoSketch | 5 iters, 3.7e-5 | 5 iters, 7.7e-5 |
+| ChicagoRegional | 9 iters, 5.3e-5 | 11 iters, 6.1e-5 |
+
+Two new parameters-file tags keep every prior behaviour reachable without a
+rebuild:
+
+```
+<UPDATE BUSH SCAN> LONGEST_USED_OR_SP    ~ or LONGEST_BUSH_PATH,
+                                         ~ LONGEST_USED_PATH, NO_LONGEST_PATH
+<LOOSE CRITERION>
+```
+
+The scan type was previously not settable from a parameters file at all. The
+non-default scans reproduce the unsound-label condition above; they exist for
+A/B against the old behaviour, not for production use.
+
+### 11. `src/bush.c`, `src/parallel_bush.c` — cycle diagnostics and a self-test hook
+
+Permanent test tooling, built to diagnose the crash in section 10 and kept
+because the next cycle bug should cost minutes, not another instrumented DC
+run. Two pieces, both inert in normal operation:
+
+- **A cycle dump at the failure site.** `genericTopologicalOrder` previously
+  died reporting only a placement count, which cannot distinguish a genuine
+  directed cycle from corrupted merge bookkeeping, and named no links. It now
+  writes `f1_cycle_dump.txt` before dying: the unplaced set with labels, an
+  actual cycle walked out of it arc by arc (SP/LP labels, flow, preload, which
+  add/preserve branch added each arc this call), and summary verdict inputs.
+  The walk is guaranteed to terminate in a cycle if one exists, and reports
+  corrupted bookkeeping explicitly if it stalls instead.
+- **`<SELFTEST INJECT CYCLE>`** — a parameters-file tag that, once per run,
+  injects a genuine two-cycle into a bush by adding the reverse of an in-bush
+  arc. `reconstructMerges` accepts it, the topological order fails, and the
+  dump path runs end to end on real data structures in seconds on SiouxFalls.
+  Breaks the solve by design; never enabled by a normal run. This is how the
+  dump itself is validated — a diagnostic you cannot trigger on demand is a
+  diagnostic you cannot trust.
+
+Instrumentation cost was measured before promotion: diag and stock binaries at
+one thread produce identical gap, objective and shift count at every iteration
+on SiouxFalls, Anaheim and ChicagoSketch, and per-iteration solver times on DC
+within 1–4%.
+
 ## Not upstreamed (yet)
 
 The pooled `bushSPTT`, the pooled bush init, the `SRCS`/`SOURCES` Makefile bug,
 the cost-update hoist and the wall-clock timing are all clean wins that would
 apply to any user, and are reasonable pull requests whenever we have time to
-write them against upstream's current `develop`. The dialect pin and the bins
+write them against upstream's current `develop`. The cycle fix (section 10) is
+the one upstream most needs — they have hit this class of bug twice — but it
+changes their default, so it would need the conversation, not just the patch. The dialect pin and the bins
 default are opinionated and probably belong to us. The preload is a feature
 upstream may or may not want; we would offer it.
 

@@ -12,6 +12,304 @@
 #include "parallel_bush.h"
 #endif
 
+/***********************************************************************
+ * IVES FORK, cycle diagnostics (built for F1, promoted as a permanent test
+ * hook in F2 -- IVES-FORK.md sections 10-11)
+ *
+ * genericTopologicalOrder dies with "contains a cycle" but reports only a
+ * placement count, which cannot distinguish a genuine directed cycle in the
+ * bush from corrupted merge bookkeeping, and says nothing about which link
+ * closed the cycle.  This block adds two things and changes no behaviour:
+ *
+ *  1. A per-thread record of the links marked NEW_LINK by the current
+ *     updateBushB call.  reconstructMerges clears those markers to 0 before
+ *     the topological order runs (parallel_bush.c:183,191), so at the crash
+ *     site "was this link added this iteration?" is otherwise unanswerable.
+ *  2. A dump at the failure site: the unplaced set, and an actual cycle
+ *     walked out of it.
+ *
+ * The walk is guaranteed to terminate in a cycle.  A node's initial indegree
+ * is exactly its number of in-bush incoming arcs (1 via pred for non-merges,
+ * numApproaches for merges), and it is decremented once per in-bush incoming
+ * arc whose tail got placed.  So an unplaced node has residual indegree > 0,
+ * i.e. at least one in-bush incoming arc from an unplaced tail; following
+ * those backwards inside a finite set must repeat a node.
+ ***********************************************************************/
+
+#include <pthread.h>
+
+__thread int *diagNewArc = NULL;
+__thread int *diagNewArcBranch = NULL;
+__thread int diagNewArcCap = 0;
+__thread int diagNumNewArcs = 0;
+
+static int diagReported = 0;
+static pthread_mutex_t diagLock = PTHREAD_MUTEX_INITIALIZER;
+
+void diagResetNewArcs(void) {
+    diagNumNewArcs = 0;
+}
+
+void diagRecordNewArc(int ij, int branch) {
+    if (diagNumNewArcs >= diagNewArcCap) {
+        int newCap = (diagNewArcCap == 0) ? 4096 : diagNewArcCap * 2;
+        int *a = realloc(diagNewArc, newCap * sizeof(int));
+        int *b = realloc(diagNewArcBranch, newCap * sizeof(int));
+        if (a == NULL || b == NULL)
+            fatalError("F1 diagnostic: out of memory recording new arcs");
+        diagNewArc = a;
+        diagNewArcBranch = b;
+        diagNewArcCap = newCap;
+    }
+    diagNewArc[diagNumNewArcs] = ij;
+    diagNewArcBranch[diagNumNewArcs] = branch;
+    diagNumNewArcs++;
+}
+
+/* 0 = not added this call, 1 = strict shortcut criterion,
+   2 = shortest-path-tree re-add (exact float equality branch),
+   3 = loose criterion (inactive unless <LOOSE CRITERION> is set) */
+int diagNewArcBranchOf(int ij) {
+    int k;
+    for (k = 0; k < diagNumNewArcs; k++)
+        if (diagNewArc[k] == ij) return diagNewArcBranch[k];
+    return 0;
+}
+
+/*
+ * diagInjectTwoCycle -- self-test only (<SELFTEST INJECT CYCLE> in the
+ * parameters file).
+ * Finds an in-bush arc (i,j) whose reverse (j,i) exists in the network and is
+ * not already in the bush, and marks the reverse NEW_LINK.  Both endpoints
+ * must be through nodes, so the criterion the real code applies to new links
+ * is respected and reconstructMerges builds a merge at i rather than erroring.
+ * Result: a genuine directed two-cycle in the bush, so the topological order
+ * fails and the dump path runs on real data structures.
+ */
+void diagInjectTwoCycle(int origin, network_type *network,
+                        bushes_type *bushes) {
+    static int injected = 0;
+    int ij, ji, originNode = origin2node(network, origin);
+    arcListElt *curArc;
+
+    if (__sync_bool_compare_and_swap(&injected, 0, 1) == 0) return;
+
+    for (ij = 0; ij < network->numArcs; ij++) {
+        int i = network->arcs[ij].tail, j = network->arcs[ij].head;
+        if (i == originNode || j == originNode) continue;
+        if (i < network->firstThroughNode || j < network->firstThroughNode)
+            continue;
+        if (isInBush(origin, ij, network, bushes) == FALSE) continue;
+        for (curArc = network->nodes[i].reverseStar.head; curArc != NULL;
+             curArc = curArc->next) {
+            ji = ptr2arc(network, curArc->arc);
+            if (network->arcs[ji].tail != j) continue;
+            if (isInBush(origin, ji, network, bushes) == TRUE) continue;
+#if PARALLELISM
+            if (bushes->flow_par[origin][ji] > 0) continue;
+            bushes->flow_par[origin][ji] = NEW_LINK;
+#else
+            if (bushes->flow[ji] > 0) continue;
+            bushes->flow[ji] = NEW_LINK;
+#endif
+            diagRecordNewArc(ji, 99); /* 99 marks the injected arc */
+            displayMessage(LOW_NOTIFICATIONS,
+                           "F1 SELFTEST: injected two-cycle in bush %d via arc "
+                           "%d (%d -> %d), reversing arc %d (%d -> %d)\n",
+                           origin + 1, ji, j + 1, i + 1, ij, i + 1, j + 1);
+            return;
+        }
+    }
+    injected = 0; /* found nothing this call; let a later call try */
+    displayMessage(LOW_NOTIFICATIONS,
+                   "F1 SELFTEST: no injectable two-cycle in bush %d\n",
+                   origin + 1);
+}
+
+static double diagSPcost(int origin, int i, bushes_type *bushes) {
+#if PARALLELISM
+    return bushes->SPcost_par[origin][i];
+#else
+    (void) origin;
+    return bushes->SPcost[i];
+#endif
+}
+
+static double diagLPcost(int origin, int i, bushes_type *bushes) {
+#if PARALLELISM
+    return bushes->LPcost_par[origin][i];
+#else
+    (void) origin;
+    return bushes->LPcost[i];
+#endif
+}
+
+static double diagFlow(int origin, int ij, bushes_type *bushes) {
+#if PARALLELISM
+    return bushes->flow_par[origin][ij];
+#else
+    (void) origin;
+    return bushes->flow[ij];
+#endif
+}
+
+static void diagPrintArc(FILE *f, int origin, int ij, network_type *network,
+                         bushes_type *bushes, bool *placed) {
+    arc_type *a = &network->arcs[ij];
+    fprintf(f, "    arc %7d  %6d -> %6d  new=%d  flow=%.6g  preload=%.6g  "
+               "cost=%.6g  fft=%.6g  cap=%.6g  "
+               "SP(t)=%.6g SP(h)=%.6g  LP(t)=%.6g LP(h)=%.6g  "
+               "tailPlaced=%d headPlaced=%d tailMerge=%d headMerge=%d\n",
+            ij, a->tail + 1, a->head + 1, diagNewArcBranchOf(ij),
+            diagFlow(origin, ij, bushes), a->preload, a->cost,
+            a->freeFlowTime, a->capacity,
+            diagSPcost(origin, a->tail, bushes),
+            diagSPcost(origin, a->head, bushes),
+            diagLPcost(origin, a->tail, bushes),
+            diagLPcost(origin, a->head, bushes),
+            placed[a->tail], placed[a->head],
+            isMergeNode(origin, a->tail, bushes),
+            isMergeNode(origin, a->head, bushes));
+}
+
+/*
+ * diagReportCycle -- called from genericTopologicalOrder when placement stalls.
+ * Writes a full account to f1_cycle_dump.txt in the working directory (a file
+ * rather than stdout so the dump survives whatever the run's verbosity is, and
+ * so it cannot be interleaved with other threads' notifications).  Only the
+ * first failing origin reports; the process is about to die anyway.
+ */
+void diagReportCycle(int origin, network_type *network, bushes_type *bushes,
+                     bool *placed, int *indegree, int numPlaced) {
+    int i, hi, k, len, start, cur, cycleStart, listed;
+    int numUnplaced = network->numNodes - numPlaced;
+    int numUnplacedMerge = 0, numUnplacedZone = 0;
+    int cycleNew = 0, cyclePreloaded = 0, cycleZeroFlow = 0;
+    arcListElt *curArc;
+    FILE *f;
+
+    if (__sync_bool_compare_and_swap(&diagReported, 0, 1) == 0) return;
+    pthread_mutex_lock(&diagLock);
+
+    f = fopen("f1_cycle_dump.txt", "w");
+    if (f == NULL) f = stdout;
+
+    fprintf(f, "==== F1 CYCLE DUMP ====\n");
+    fprintf(f, "origin (1-based): %d   origin node (1-based): %d\n",
+            origin + 1, origin2node(network, origin) + 1);
+    fprintf(f, "placed: %d of %d nodes; unplaced: %d\n",
+            numPlaced, network->numNodes, numUnplaced);
+    fprintf(f, "numArcs: %d  numZones: %d  firstThroughNode (1-based): %d\n",
+            network->numArcs, network->numZones, network->firstThroughNode + 1);
+    fprintf(f, "links marked NEW_LINK by this updateBushB call: %d\n",
+            diagNumNewArcs);
+
+    for (i = 0; i < network->numNodes; i++) {
+        if (placed[i] == TRUE) continue;
+        if (isMergeNode(origin, i, bushes) == TRUE) numUnplacedMerge++;
+        if (i < network->firstThroughNode) numUnplacedZone++;
+    }
+    fprintf(f, "unplaced that are merge nodes: %d;  unplaced that are zones "
+               "(below firstThroughNode): %d\n\n", numUnplacedMerge,
+            numUnplacedZone);
+
+    /* ---- the unplaced set, with its in-bush incoming arcs ---- */
+    fprintf(f, "---- UNPLACED NODES (first 120) ----\n");
+    listed = 0;
+    for (i = 0; i < network->numNodes && listed < 120; i++) {
+        if (placed[i] == TRUE) continue;
+        listed++;
+        fprintf(f, "node %d (1-based)  merge=%d  residualIndegree=%d  "
+                   "SP=%.6g LP=%.6g\n",
+                i + 1, isMergeNode(origin, i, bushes), indegree[i],
+                diagSPcost(origin, i, bushes), diagLPcost(origin, i, bushes));
+        for (curArc = network->nodes[i].reverseStar.head; curArc != NULL;
+             curArc = curArc->next) {
+            hi = ptr2arc(network, curArc->arc);
+            if (isInBush(origin, hi, network, bushes) == TRUE)
+                diagPrintArc(f, origin, hi, network, bushes, placed);
+        }
+    }
+    if (numUnplaced > listed)
+        fprintf(f, "... %d further unplaced nodes not listed\n",
+                numUnplaced - listed);
+
+    /* ---- walk out an actual cycle ---- */
+    fprintf(f, "\n---- CYCLE WALK ----\n");
+    declareVector(int, onPath, network->numNodes);
+    declareVector(int, path, network->numNodes + 1);
+    declareVector(int, pathArc, network->numNodes + 1);
+    for (i = 0; i < network->numNodes; i++) onPath[i] = -1;
+
+    start = -1;
+    for (i = 0; i < network->numNodes; i++)
+        if (placed[i] == FALSE) { start = i; break; }
+
+    cur = start;
+    len = 0;
+    cycleStart = -1;
+    while (cur >= 0 && onPath[cur] == -1) {
+        int chosen = -1;
+        onPath[cur] = len;
+        path[len] = cur;
+        for (curArc = network->nodes[cur].reverseStar.head; curArc != NULL;
+             curArc = curArc->next) {
+            hi = ptr2arc(network, curArc->arc);
+            if (isInBush(origin, hi, network, bushes) == TRUE
+                && placed[network->arcs[hi].tail] == FALSE) {
+                chosen = hi;
+                break;
+            }
+        }
+        if (chosen == -1) {
+            fprintf(f, "WALK STALLED at node %d (1-based %d): no in-bush "
+                       "incoming arc from an unplaced tail, yet the node was "
+                       "never placed.  That means the indegree bookkeeping "
+                       "disagrees with isInBush -- corrupted merge state, not "
+                       "a cycle.\n", cur, cur + 1);
+            break;
+        }
+        pathArc[len] = chosen;
+        len++;
+        cur = network->arcs[chosen].tail;
+    }
+    if (cur >= 0 && onPath[cur] != -1) cycleStart = onPath[cur];
+
+    if (cycleStart >= 0) {
+        fprintf(f, "cycle found: %d nodes, reached after walking %d nodes back "
+                   "from unplaced node %d (1-based)\n",
+                len - cycleStart, cycleStart, start + 1);
+        fprintf(f, "cycle node sequence (1-based, in bush/forward direction):\n"
+                   "  ");
+        for (k = len - 1; k >= cycleStart; k--)
+            fprintf(f, "%d%s", path[k] + 1, (k > cycleStart) ? " -> " : "");
+        fprintf(f, " -> %d\n", path[len - 1] + 1);
+        fprintf(f, "cycle arcs (forward direction):\n");
+        for (k = len - 1; k >= cycleStart; k--) {
+            diagPrintArc(f, origin, pathArc[k], network, bushes, placed);
+            if (diagNewArcBranchOf(pathArc[k]) != 0) cycleNew++;
+            if (network->arcs[pathArc[k]].preload > 0) cyclePreloaded++;
+            if (diagFlow(origin, pathArc[k], bushes) == 0) cycleZeroFlow++;
+        }
+        fprintf(f, "\nVERDICT INPUTS\n");
+        fprintf(f, "  cycle length              : %d arcs\n", len - cycleStart);
+        fprintf(f, "  added this updateBushB    : %d\n", cycleNew);
+        fprintf(f, "  carrying nonzero preload  : %d\n", cyclePreloaded);
+        fprintf(f, "  carrying zero bush flow   : %d\n", cycleZeroFlow);
+    }
+
+    fprintf(f, "\n---- LINKS ADDED THIS updateBushB CALL (first 200) ----\n");
+    for (k = 0; k < diagNumNewArcs && k < 200; k++)
+        diagPrintArc(f, origin, diagNewArc[k], network, bushes, placed);
+
+    fflush(f);
+    if (f != stdout) fclose(f);
+    deleteVector(onPath);
+    deleteVector(path);
+    deleteVector(pathArc);
+    pthread_mutex_unlock(&diagLock);
+}
+
 /*
  * AlgorithmB -- master function controlling overall flow of the algorithm.
  * Arguments are pointers to a network, and to a struct of algorithm
@@ -182,7 +480,22 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
     
     parameters.includeGapTime = TRUE;
 
-    parameters.updateBushScanType = LONGEST_USED_OR_SP;
+    /* IVES FORK: full LP labels, not upstream's LONGEST_USED_OR_SP.  The
+     * add/preserve guards in updateBushB compare LPcost across nodes, which
+     * is only sound when every bush arc constrains LPcost; the mixed-scale
+     * labels of LONGEST_USED_OR_SP let the SP-tree re-add branch preserve an
+     * LP-backwards arc and the strict criterion then closes a cycle (crashed
+     * DC; IVES-FORK.md section 10).  Measured cost of the full scan: 0-2
+     * extra iterations on the TNTP test networks.  Old behaviour reachable
+     * via <UPDATE BUSH SCAN> without a rebuild. */
+    parameters.updateBushScanType = LONGEST_BUSH_PATH;
+    /* IVES FORK: the loose criterion is decoupled from the scan type.
+     * Upstream gates it on updateBushScanType == LONGEST_BUSH_PATH, but that
+     * combination hard-stalls SiouxFalls (gap flat at 2.1e-3, 40+ iterations,
+     * identical shift count) -- so switching the scan type above must not
+     * silently activate it.  <LOOSE CRITERION> turns it on. */
+    parameters.useLooseCriterion = FALSE;
+    parameters.selftestInjectCycle = FALSE; /* IVES FORK: <SELFTEST INJECT CYCLE> */
     /* IVES FORK: reduced-cost bins are diagnostic-only (they feed nothing but
      * DEBUG display in bushSPTT), but computing them is O(origins x arcs) and
      * their upstream TRUE default routes bushSPTT down the serial per-origin
@@ -497,10 +810,12 @@ void genericTopologicalOrder(int origin, network_type *network,
     arcListElt *curArc;
     int i, j, m,  next, highestMerge = 0;
     declareVector(int, indegree, network->numNodes);
+    declareVector(bool, placed, network->numNodes); /* IVES F1 DIAGNOSTIC */
     for (i = 0; i < network->numNodes; i++) {
         indegree[i] = 1; /* By default non-origin nodes are assumed to have 1
                             incoming link; merges and origin handled below */
         bushes->bushOrder[origin][i] = NO_PATH_EXISTS;
+        placed[i] = FALSE; /* IVES F1 DIAGNOSTIC */
     }
     for (i = 0; i < network->numNodes; i++) {
         if (isMergeNode(origin, i, bushes) == TRUE) {
@@ -518,6 +833,7 @@ void genericTopologicalOrder(int origin, network_type *network,
     while (LIST.curelts > 0) {
         i = deQueue(&LIST);
         bushes->bushOrder[origin][next] = i;
+        placed[i] = TRUE; /* IVES F1 DIAGNOSTIC */
         if (isMergeNode(origin, i, bushes) == TRUE) highestMerge = next;
         next++;
         for (curArc = network->nodes[i].forwardStar.head; curArc != NULL;
@@ -531,8 +847,11 @@ void genericTopologicalOrder(int origin, network_type *network,
         }
     }
     if (next < network->numNodes) {
-        displayMessage(LOW_NOTIFICATIONS, "origin: %d, next: %d, network->numNodes: %d\n", 
+        displayMessage(LOW_NOTIFICATIONS, "origin: %d, next: %d, network->numNodes: %d\n",
                            origin+1, next, network->numNodes);
+        /* IVES F1 DIAGNOSTIC: dump the unplaced set and the actual cycle to
+           f1_cycle_dump.txt before dying. */
+        diagReportCycle(origin, network, bushes, placed, indegree, next);
         fatalError("#%d: Graph given to bushTopologicalOrder contains a cycle.", origin+1);
     }
     bushes->lastMerge[origin] = highestMerge;
@@ -540,6 +859,7 @@ void genericTopologicalOrder(int origin, network_type *network,
 //    displayMessage(FULL_NOTIFICATIONS, "Deleting topo order q\n");
     deleteQueue(&LIST);
     deleteVector(indegree);
+    deleteVector(placed); /* IVES F1 DIAGNOSTIC */
 //    displayMessage(FULL_NOTIFICATIONS, "Deleted topo order q\n");
 
     /* Suppress warnings -- parameters is not used in this implementation */
@@ -1105,7 +1425,9 @@ void scanBushes(int origin, network_type *network, bushes_type *bushes,
 void updateBushB(int origin, network_type *network, bushes_type *bushes,
                  algorithmBParameters_type *parameters) {
     int ij, i, j, newArcs = 0;
-  
+
+    diagResetNewArcs(); /* IVES F1 DIAGNOSTIC */
+
     /* First update labels... ignoring longest unused paths since those will be
      * removed in the next step. */
     scanBushes(origin, network, bushes, parameters, parameters->updateBushScanType);
@@ -1132,6 +1454,7 @@ void updateBushB(int origin, network_type *network, bushes_type *bushes,
                 || network->arcs[ij].tail >= network->firstThroughNode)) 
         {
             bushes->flow[ij] = NEW_LINK;
+            diagRecordNewArc(ij, 1); /* IVES F1 DIAGNOSTIC */
             newArcs++;
         /* Never delete shortest path tree... should be OK with floating point
          * comparison since this is how SPcost is calculated */
@@ -1139,11 +1462,15 @@ void updateBushB(int origin, network_type *network, bushes_type *bushes,
                    && bushes->flow[ij] == 0
                    && isInBush(origin, ij, network, bushes) == TRUE) {
             bushes->flow[ij] = NEW_LINK;
+            diagRecordNewArc(ij, 2); /* IVES F1 DIAGNOSTIC */
         }
     }
    
-    /* If strict criterion fails, try a looser one */
-    if (newArcs == 0 && parameters->updateBushScanType == LONGEST_BUSH_PATH) {
+    /* If strict criterion fails, try a looser one.  IVES FORK: gated on its
+     * own parameter, not on updateBushScanType == LONGEST_BUSH_PATH as
+     * upstream has it -- that coupling hard-stalls SiouxFalls now that the
+     * full-LP scan is the default (IVES-FORK.md section 10). */
+    if (newArcs == 0 && parameters->useLooseCriterion == TRUE) {
         for (ij = 0; ij < network->numArcs; ij++) {
             i = network->arcs[ij].tail;
             j = network->arcs[ij].head;
@@ -1154,9 +1481,14 @@ void updateBushB(int origin, network_type *network, bushes_type *bushes,
                     || network->arcs[ij].tail >= network->firstThroughNode))
             {
                 bushes->flow[ij] = NEW_LINK;
+                diagRecordNewArc(ij, 3); /* IVES FORK cycle diagnostics */
             }
         }
-    }      
+    }
+
+    /* IVES FORK test hook, off by default -- see diagInjectTwoCycle */
+    if (parameters->selftestInjectCycle == TRUE)
+        diagInjectTwoCycle(origin, network, bushes);
 
    /* Finally update bush data structures: delete/add merges, find a new
     * topological order, rectify approach proportions */

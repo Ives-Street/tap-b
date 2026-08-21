@@ -189,6 +189,28 @@ typedef struct bushes_type {
  *                       initialization).  See datastructures.h for options;
  *                       default value is DEQUE.
  *  updateBushScanType -- Scanning algorithm used when updating bush labels.
+ *                        IVES FORK: default is LONGEST_BUSH_PATH (upstream used
+ *                        LONGEST_USED_OR_SP).  The updateBushB add/preserve
+ *                        guards compare LPcost across nodes, which is only
+ *                        sound if LP order is a topological order of the whole
+ *                        bush -- i.e. every bush arc constrains LPcost.  Under
+ *                        LONGEST_USED_OR_SP a node with no longest-used path
+ *                        falls back to its SP label, so LP labels sit on
+ *                        different scales and the SP-tree re-add branch can
+ *                        preserve an arc running backwards in LP, letting the
+ *                        strict criterion close a cycle (crashed DC, 2026-08;
+ *                        IVES-FORK.md section 10).
+ *  useLooseCriterion -- IVES FORK: enables the fallback loose link-add
+ *                       criterion when the strict one adds nothing.  Upstream
+ *                       gated it on updateBushScanType == LONGEST_BUSH_PATH;
+ *                       decoupled here because that combination hard-stalls
+ *                       SiouxFalls (gap flat at 2.1e-3 for 40+ iterations).
+ *                       Default FALSE.
+ *  selftestInjectCycle -- IVES FORK: test hook.  Once per run, injects a
+ *                         genuine two-cycle into a bush (adds the reverse of an
+ *                         in-bush arc) so the topological order fails and the
+ *                         cycle dump path runs on real data structures.  Breaks
+ *                         the solve by design.  Default FALSE.
  *  createInitialBush -- Function pointer for how bushes are initially set up.
  *                       Default value is initialBushShortestPath (setting bush
  *                       to the one-to-all shortest path tree at free flow.
@@ -257,6 +279,8 @@ typedef struct algorithmBParameters_type{
    bool     calculateEntropy;
    queueDiscipline SPQueueDiscipline;
    scan_type updateBushScanType;
+   bool     useLooseCriterion;   /* IVES FORK, see block comment above */
+   bool     selftestInjectCycle; /* IVES FORK, see block comment above */
    void     (*createInitialBush)(int, network_type *, bushes_type *,
                                  struct algorithmBParameters_type *);
    void     (*topologicalOrder)(int, network_type *, bushes_type *,
@@ -331,6 +355,18 @@ void initialBushBFS(int origin, network_type *network, bushes_type *bushes,
 void genericTopologicalOrder(int origin, network_type *network,
                              bushes_type *bushes,
                              algorithmBParameters_type *parameters);
+
+/* IVES FORK, cycle diagnostics -- see the block at the top of bush.c.
+   Records the links marked NEW_LINK by the current updateBushB call so the
+   topological-order failure site can say which ones sit in the cycle, and
+   dumps the unplaced set plus an actual cycle to f1_cycle_dump.txt. */
+void diagResetNewArcs(void);
+void diagRecordNewArc(int ij, int branch);
+int  diagNewArcBranchOf(int ij);
+void diagReportCycle(int origin, network_type *network, bushes_type *bushes,
+                     bool *placed, int *indegree, int numPlaced);
+void diagInjectTwoCycle(int origin, network_type *network,
+                        bushes_type *bushes);
 void mergeFirstTopologicalOrder(int origin, network_type *network,
                                 bushes_type *bushes,
                                 algorithmBParameters_type *parameters);
