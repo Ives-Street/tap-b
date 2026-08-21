@@ -372,7 +372,17 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
             loadBatch(batch, network, &bushes, parameters);
             updateBatchBushes(network, bushes, &lastClass, parameters);
             updateBatchFlows(network, bushes, &lastClass, parameters);
-            storeBatch(batch, network, bushes, parameters);
+            /* IVES FORK: with a single batch nothing reads the stored bushes
+             * back within the run (loadBatch skips the read), so a
+             * <STORE BUSHES> run only needs the final state -- written once
+             * after the loop.  In-loop storing at numBatches == 1 rewrote the
+             * full bush file every iteration inside the timed region (1.35 GB
+             * x 40 iterations = ~54 GB on a DC solve) for nothing.  Multi-
+             * batch runs still store here: each batch's state must persist
+             * while the others occupy memory. */
+            if (network->numBatches > 1) {
+                storeBatch(batch, network, bushes, parameters);
+            }
             /* Check gap and report progress. */
             clock_gettime(CLOCK_MONOTONIC_RAW, &tock);
             elapsedTime += (double)((1e9 * (tock.tv_sec - tick.tv_sec)
@@ -417,6 +427,12 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
     } 
     if (parameters->calculateEntropy == TRUE) {
         displayMessage(FULL_NOTIFICATIONS, "Final entropy: %.15f\n", entropy);
+    }
+    /* IVES FORK: the single-batch <STORE BUSHES> write deferred from the
+     * loop above -- final state only, which is all the warm-start cache
+     * consumes. */
+    if (network->numBatches == 1 && parameters->storeBushes == TRUE) {
+        storeBatch(0, network, bushes, parameters);
     }
 
     for (int i = 0; i < network->numZones; i++) {
@@ -604,7 +620,12 @@ void initializeAlgorithmB(network_type *network, bushes_type **bushes,
         }
         snprintf(batchFileName, 2*STRING_SIZE, "%s%d.bin",
                  parameters->batchStem, batch);
-        if (network->numBatches > 1 || parameters->storeBushes == TRUE) {
+        /* IVES FORK: single-batch <STORE BUSHES> writes once, after the
+         * convergence loop (see AlgorithmB) -- the init-time write here was
+         * the same waste as the in-loop one, superseded before anything could
+         * read it.  Multi-batch still writes: batches must be on disk to be
+         * reloaded during the first iteration. */
+        if (network->numBatches > 1) {
             writeBushes(network, *bushes, batchFileName);
         }
     }

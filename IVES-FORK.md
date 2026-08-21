@@ -368,6 +368,25 @@ one thread produce identical gap, objective and shift count at every iteration
 on SiouxFalls, Anaheim and ChicagoSketch, and per-iteration solver times on DC
 within 1–4%.
 
+### 12. `src/bush.c` — single-batch `<STORE BUSHES>` writes once, at the end
+
+With one batch, nothing reads the stored bushes back during a run (`loadBatch`
+skips the read at `numBatches == 1`), so only the final state matters — it is
+what the warm-start cache consumes. Upstream's in-loop `storeBatch` call
+nevertheless rewrote the full bush file every iteration, inside the timed
+region: 1.35 GB × 40 iterations ≈ **54 GB written per DC solve**. The write is
+now deferred to after the convergence loop for the single-batch case;
+multi-batch runs still store in-loop, where the write is load-bearing (each
+batch's state must persist while the others occupy memory).
+
+Explicitly **not** a performance claim: measured via `/proc/PID/io` against a
+disk benchmarking at 965 MB/s, the waste cost ~11 s of disk time per solve, 0
+major faults, 0 swap. This is hygiene — SSD wear and disk pressure, not speed.
+A side effect worth knowing: a run that dies mid-solve now leaves no
+freshly-written batch file rather than the previous iteration's — absence is
+cleaner than a mid-convergence snapshot for anything keying a warm-start cache
+on it.
+
 ## Not upstreamed (yet)
 
 The pooled `bushSPTT`, the pooled bush init, the `SRCS`/`SOURCES` Makefile bug,
