@@ -312,6 +312,9 @@ typedef struct algorithmBParameters_type{
                               when gapTiming is TRUE; read back at the call
                               site to print alongside the iteration number. */
    double   gapTSTTTime;  /* IVES FORK: same, for TSTT/bushTSTT. */
+   double   gapScanTime;  /* IVES FORK: CPU-seconds (summed over threads) in
+                              scanBushes_par across the phase's origins. */
+   double   gapBFTime;    /* IVES FORK: same, for BellmanFord_NoLabel. */
    bool     calculateBins;
    /* IVES FORK: force the stock serial initial-bush loop in a parallel build.
       Exists so the pooled initializeBushesB can be compared against the code it

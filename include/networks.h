@@ -187,6 +187,24 @@ void arcIndexBellmanFord(int origin, double *label, int *backarc,
                          network_type *network, queueDiscipline q);
 void BellmanFord_NoLabel(int origin, double *label, network_type *network,
                          queueDiscipline q, double *labelGuess, int *order);
+
+/* IVES FORK: <GAP TIMING> work counters for BellmanFord_NoLabel.
+ *
+ * Wall time alone cannot tell "more relaxations" apart from "the same
+ * relaxations, running slower" -- and those two point at completely different
+ * fixes (the seed/queue discipline vs memory layout and thread count).  These
+ * count the work itself, which is what wall time is a proxy for.  Counts are
+ * also load-insensitive, so a sweep does not need the box to itself.
+ *
+ * Each call accumulates into function-local registers and publishes once at
+ * the end via one atomic add per call, so the inner loop stays lock-free and
+ * the pooled per-origin callers aggregate correctly.  Publication is gated on
+ * bfCountersEnable(); the counters are inert otherwise. */
+void bfCountersEnable(void);
+void bfCountersReset(void);
+void bfCountersRead(unsigned long long *calls, unsigned long long *seeds,
+                    unsigned long long *pops, unsigned long long *arcScans,
+                    unsigned long long *relaxations);
 void heapDijkstra(int origin, double *label, int *backnode,
                   network_type *network);
 

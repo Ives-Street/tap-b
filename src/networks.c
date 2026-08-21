@@ -369,12 +369,33 @@ void arcIndexBellmanFord(int origin, double *label, int *backarc, network_type
  *     ordering available.
  */
 
+/* IVES FORK: <GAP TIMING> work counters -- see the block comment in
+ * networks.h.  File-scope, published one atomic add per call. */
+static bool bfCounting = FALSE;
+static unsigned long long bfCalls, bfSeeds, bfPops, bfArcScans, bfRelaxations;
+
+void bfCountersEnable(void) { bfCounting = TRUE; }
+
+void bfCountersReset(void) {
+    bfCalls = 0; bfSeeds = 0; bfPops = 0; bfArcScans = 0; bfRelaxations = 0;
+}
+
+void bfCountersRead(unsigned long long *calls, unsigned long long *seeds,
+                    unsigned long long *pops, unsigned long long *arcScans,
+                    unsigned long long *relaxations) {
+    *calls = bfCalls; *seeds = bfSeeds; *pops = bfPops;
+    *arcScans = bfArcScans; *relaxations = bfRelaxations;
+}
+
 void BellmanFord_NoLabel(int origin, double *label, network_type *network,
                          queueDiscipline q, double *labelGuess, int *order) {
     int ij, j, curnode, tail, head;
     arcListElt *i;
     double tempLabel;
-    
+    /* IVES FORK: <GAP TIMING> work counters.  Locals, so the inner loop takes
+     * a register increment and no synchronization; published once below. */
+    unsigned long long nSeeds = 0, nPops = 0, nArcScans = 0, nRelaxations = 0;
+
     queue_type SEL = createQueue(network->numNodes, network->numNodes);
 
     /* Initialize */
@@ -384,6 +405,7 @@ void BellmanFord_NoLabel(int origin, double *label, network_type *network,
         }
         label[origin] = 0;
         enQueue(&SEL, origin);
+        nSeeds++;
     } else {
         for (j = 0; j < network->numNodes; j++) {
             label[j] = labelGuess[j];
@@ -395,6 +417,7 @@ void BellmanFord_NoLabel(int origin, double *label, network_type *network,
                 if (tail < network->firstThroughNode) continue;
                 if (label[tail] + network->arcs[ij].cost < label[head]) {
                     enQueue(&SEL,tail);
+                    nSeeds++;
                 }
             }
         } else {
@@ -404,6 +427,7 @@ void BellmanFord_NoLabel(int origin, double *label, network_type *network,
                      i = i->next) {
                     if (label[order[j]] + i->arc->cost < label[i->arc->head]) {
                         enQueue(&SEL,order[j]);
+                        nSeeds++;
                         break;
                     }
                 }
@@ -412,15 +436,18 @@ void BellmanFord_NoLabel(int origin, double *label, network_type *network,
     }
 
    /* Iterate */
-    while (SEL.readptr != SEL.writeptr) {  
+    while (SEL.readptr != SEL.writeptr) {
     /* See comment above about read and write pointers */
         curnode = deQueue(&SEL);
+        nPops++;
         for (i = network->nodes[curnode].forwardStar.head; i != NULL;
                 i = i->next) {
+            nArcScans++;
             tempLabel = label[curnode] + i->arc->cost;
             j = i->arc->head;
             if (tempLabel < label[j]) { /* Found a better path to node j */
                 label[j] = tempLabel;
+                nRelaxations++;
                 if (j >= network->firstThroughNode) { 
                 /* Ensure we do not use centroids/centroid connectors as
                  * "shortcuts" */
@@ -440,6 +467,17 @@ void BellmanFord_NoLabel(int origin, double *label, network_type *network,
                 }
             }
         }
+    }
+
+    /* IVES FORK: <GAP TIMING>.  Publish this call's totals -- one atomic add
+     * apiece, outside every loop, so the pooled per-origin callers aggregate
+     * without contending on the hot path. */
+    if (bfCounting == TRUE) {
+        __atomic_fetch_add(&bfCalls, 1ULL, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&bfSeeds, nSeeds, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&bfPops, nPops, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&bfArcScans, nArcScans, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&bfRelaxations, nRelaxations, __ATOMIC_RELAXED);
     }
 
     /* Clean up */

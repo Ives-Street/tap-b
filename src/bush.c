@@ -398,9 +398,11 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
              * bushSPTT's pooled workers. */
             struct timespec gapTick, gapTock;
             struct rusage ruBefore, ruAfter;
+            unsigned long long bfCalls, bfSeeds, bfPops, bfArcs, bfRelax;
             if (parameters->gapTiming) {
                 clock_gettime(CLOCK_MONOTONIC_RAW, &gapTick);
                 getrusage(RUSAGE_SELF, &ruBefore);
+                bfCountersReset();
             }
             batchGap = bushRelativeGap(network, bushes, parameters);
             if (parameters->gapTiming) {
@@ -417,6 +419,25 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
                     ruAfter.ru_minflt - ruBefore.ru_minflt,
                     ruAfter.ru_majflt - ruBefore.ru_majflt,
                     ruAfter.ru_maxrss);
+                /* IVES FORK: <GAP TIMING>.  The work behind that wall time.
+                 * scan/bf are CPU-seconds summed over threads; the counters
+                 * are exact totals for the phase.  arcScans per call, divided
+                 * by the network's arc count, is how many times the SPTT pass
+                 * sweeps the network per origin -- the quantity that separates
+                 * "more relaxations" from "the same relaxations, slower". */
+                bfCountersRead(&bfCalls, &bfSeeds, &bfPops, &bfArcs, &bfRelax);
+                displayMessage(LOW_NOTIFICATIONS,
+                    "GAP WORK iter %d: scan %.3f s, bf %.3f s (CPU, summed "
+                    "over threads); bf calls %llu, seeds %llu, pops %llu, "
+                    "arcScans %llu, relaxations %llu; sweeps/origin %.2f, "
+                    "ns/arcScan %.2f\n",
+                    iteration,
+                    parameters->gapScanTime, parameters->gapBFTime,
+                    bfCalls, bfSeeds, bfPops, bfArcs, bfRelax,
+                    bfCalls == 0 ? 0.0
+                        : (double) bfArcs / bfCalls / network->numArcs,
+                    bfArcs == 0 ? 0.0
+                        : parameters->gapBFTime * 1e9 / (double) bfArcs);
             }
             displayMessage(DEBUG, "Calculated batch gap...\n");
             gap += batchGap;
@@ -526,6 +547,8 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
     parameters.gapTiming = FALSE; /* IVES FORK: <GAP TIMING> */
     parameters.gapSPTTTime = 0;
     parameters.gapTSTTTime = 0;
+    parameters.gapScanTime = 0;
+    parameters.gapBFTime = 0;
 
     /* IVES FORK: full LP labels, not upstream's LONGEST_USED_OR_SP.  The
      * add/preserve guards in updateBushB compare LPcost across nodes, which
@@ -1008,6 +1031,8 @@ typedef struct {
     bushes_type *bushes;
     algorithmBParameters_type *parameters;
     double sptt;
+    double tScan;  /* IVES FORK: <GAP TIMING>, per-origin seconds */
+    double tBF;    /* IVES FORK: <GAP TIMING>, per-origin seconds */
 } spttArgs_type;
 
 static void bushSPTTPool(void *pVoid) {
@@ -1015,10 +1040,29 @@ static void bushSPTTPool(void *pVoid) {
     int r = a->origin, j;
     network_type *network = a->network;
     bushes_type *bushes = a->bushes;
+    /* IVES FORK: <GAP TIMING>.  The two halves of a per-origin SPTT are
+     * charged separately.  scanBushes_par is O(nodes + bush arcs) and should
+     * be a fixed cost; BellmanFord_NoLabel is label-correcting and its cost
+     * depends on how far the bush tree is from the true shortest paths.  Only
+     * the second can grow superlinearly, so timing them together (as the
+     * bushRelativeGap-level timer does) cannot tell which one is the 400 s.
+     * Two clock_gettime pairs per origin per iteration -- negligible against
+     * a phase measured in seconds. */
+    struct timespec s0, s1, b1;
+    bool timing = a->parameters->gapTiming;
+    if (timing) clock_gettime(CLOCK_MONOTONIC_RAW, &s0);
     scanBushes_par(r, network, bushes, a->parameters, NO_LONGEST_PATH);
+    if (timing) clock_gettime(CLOCK_MONOTONIC_RAW, &s1);
     BellmanFord_NoLabel(origin2node(network, r), bushes->SPcost_par[r],
                         network, DEQUE, bushes->SPcost_par[r],
                         bushes->bushOrder[r]);
+    if (timing) {
+        clock_gettime(CLOCK_MONOTONIC_RAW, &b1);
+        a->tScan = (double)(s1.tv_sec - s0.tv_sec)
+                 + (s1.tv_nsec - s0.tv_nsec) / 1e9;
+        a->tBF = (double)(b1.tv_sec - s1.tv_sec)
+               + (b1.tv_nsec - s1.tv_nsec) / 1e9;
+    }
     a->sptt = 0;
     for (j = 0; j < network->numZones; j++) {
         a->sptt += network->demand[r][j] * bushes->SPcost_par[r][j];
@@ -1048,12 +1092,26 @@ double bushSPTT(network_type *network, bushes_type *bushes,
             args[r].bushes = bushes;
             args[r].parameters = parameters;
             args[r].sptt = 0;
+            args[r].tScan = 0;
+            args[r].tBF = 0;
             thpool_add_work(thpool, (void (*)(void *)) bushSPTTPool,
                             (void *) &args[r]);
             nQueued++;
         }
         thpool_wait(thpool);
         for (r = 0; r < nQueued; r++) psptt += args[r].sptt;
+        /* IVES FORK: <GAP TIMING>.  These sum per-origin wall times across
+         * threads, so they are CPU-seconds, not wall -- their ratio is the
+         * split, and their total over the phase's wall time is the achieved
+         * parallelism. */
+        if (parameters->gapTiming) {
+            parameters->gapScanTime = 0;
+            parameters->gapBFTime = 0;
+            for (r = 0; r < nQueued; r++) {
+                parameters->gapScanTime += args[r].tScan;
+                parameters->gapBFTime += args[r].tBF;
+            }
+        }
         deleteVector(args);
         /* prove-it-fired line: absent from a log means the serial loop ran */
         displayMessage(LOW_NOTIFICATIONS,

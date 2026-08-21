@@ -156,8 +156,10 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
             /* IVES FORK: cx-cold-solve-cost instrumentation.  Times bushSPTT
              * and TSTT/bushTSTT separately and reports page-fault/RSS deltas
              * per iteration -- see the block comment on gapTiming in
-             * bush.h. */
+             * bush.h.  Also arms the BellmanFord_NoLabel work counters, which
+             * are inert until this point. */
             thisRun->gapTiming = TRUE;
+            bfCountersEnable();
 		} else if (strcmp(metadataTag, "CALCULATE BINS") == 0) {
             /* IVES FORK: reduced-cost bin diagnostics, off by default here
              * (upstream defaults them on).  Switching them on also forces the
