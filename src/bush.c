@@ -587,6 +587,7 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
 
     parameters.pathFlowsFile[0] = '\0'; /* By default don't report this */    
     parameters.originVehLengthFile[0] = '\0'; /* IVES FORK: off by default */
+    parameters.originVehLengthDests = 0; /* IVES FORK: 0 = all zones */
 
     return parameters;
 }
@@ -2707,43 +2708,100 @@ void writePathFlows(network_type *network,
  * length units.  Bush flows are assigned flow alone, so <PRELOAD FILE>
  * background flow is excluded by construction.
  *
+ * <ORIGIN VEH LENGTH DESTINATIONS> n restricts the count to the demand bound
+ * for destinations 1..n (default: every zone).  The restricted flows come from
+ * a descending pass that loads only that demand and splits it at each merge in
+ * the proportions of the bush's own approach flows -- the proportional
+ * decomposition, under which every destination of an origin shares the
+ * origin's merge splits.  With every zone counted it is the same pass
+ * calculateBushFlows makes.  Connectome numbers its analysis zones before its
+ * gateway centroids, so n = analysis zones drops the internal-to-external
+ * trips that share these origins' bushes.
+ *
  * The sum is split by arc type: VehLength over arcs with neither end at a
  * zone node, ZoneArcVehLength over arcs with a zone at either end.  Under a
  * <FIRST THRU NODE> layout where zones are pure centroids (Connectome's
  * export) the second column is exactly the centroid connectors.
  *
- * Reconciliation: summed over origins, VehLength + ZoneArcVehLength equals
- * sum(arc flow x Length) on the aggregate link flows to rounding; the line
- * printed at the end reports both so a caller can assert it.  Single batch
- * only -- with several batches, only the last batch's bushes are in memory
- * here (the same restriction as writePathFlows).
+ * Reconciliation: with every zone counted, VehLength + ZoneArcVehLength summed
+ * over origins equals sum(arc flow x Length) on the aggregate link flows to
+ * rounding; the line printed at the end reports both so a caller can assert
+ * it.  Single batch only -- with several batches, only the last batch's bushes
+ * are in memory here (the same restriction as writePathFlows).
  */
+static void restrictedBushFlows(int origin, int numDests, double *flow,
+                                double *nodeFlow, network_type *network,
+                                bushes_type *bushes) {
+    int i, j, ij, a, m, node;
+    double total;
+    merge_type *merge;
+
+    for (i = 0; i < network->numNodes; i++)
+        nodeFlow[i] = (i < numDests) ? network->demand[origin][i] : 0;
+    for (ij = 0; ij < network->numArcs; ij++)
+        flow[ij] = 0;
+
+    for (node = network->numNodes - 1; node > 0; node--) {
+        j = bushes->bushOrder[origin][node];
+        if (nodeFlow[j] == 0) continue;
+        if (isMergeNode(origin, j, bushes) == FALSE) {
+            ij = bushes->pred[origin][j];
+            flow[ij] = nodeFlow[j];
+            nodeFlow[network->arcs[ij].tail] += nodeFlow[j];
+        } else {
+            m = pred2merge(bushes->pred[origin][j]);
+            merge = bushes->merges[origin][m];
+            total = 0;
+            for (a = 0; a < merge->numApproaches; a++)
+                total += merge->approachFlow[a];
+            for (a = 0; a < merge->numApproaches; a++) {
+                ij = merge->approach[a];
+                if (total > 0)
+                    flow[ij] = nodeFlow[j] * merge->approachFlow[a] / total;
+                else
+                    flow[ij] = (a == merge->SPlink) ? nodeFlow[j] : 0;
+                nodeFlow[network->arcs[ij].tail] += flow[ij];
+            }
+        }
+    }
+}
+
 void writeOriginVehLength(network_type *network, bushes_type *bushes,
                           algorithmBParameters_type *parameters) {
-    int r, i, ij, tail, head, written = 0;
+    int r, i, ij, tail, head, numDests, written = 0;
     double demand, netLen, zoneLen, x;
     double totNet = 0, totZone = 0, aggregate = 0;
 
     if (network->numBatches > 1) {
         fatalError("writeOriginVehLength does not support multiple batches.");
     }
+    numDests = parameters->originVehLengthDests;
+    if (numDests <= 0) numDests = network->numZones;
+    if (numDests > network->numZones) {
+        fatalError("<ORIGIN VEH LENGTH DESTINATIONS> %d exceeds the %d zones.",
+                   numDests, network->numZones);
+    }
+    declareVector(double, flow, network->numArcs);
+    declareVector(double, nodeFlow, network->numNodes);
+
     FILE *f = openFile(parameters->originVehLengthFile, "w");
     fprintf(f, "<NUMBER OF ORIGINS> %d\n", network->numOrigins);
     fprintf(f, "<NUMBER OF ZONES> %d\n", network->numZones);
     fprintf(f, "<NUMBER OF CLASSES> %d\n", network->numClasses);
+    fprintf(f, "<DESTINATIONS COUNTED> %d\n", numDests);
     fprintf(f, "<END OF METADATA>\n\n");
     fprintf(f, "~\tOrigin\tClass\tDemand\tVehLength\tZoneArcVehLength\t;\n");
 
     for (r = 0; r < network->batchSize; r++) {
         if (outOfOrigins(network, r) == TRUE) break;
-        calculateBushFlows(r, network, bushes);
+        restrictedBushFlows(r, numDests, flow, nodeFlow, network, bushes);
         demand = 0;
-        for (i = 0; i < network->numZones; i++) demand += network->demand[r][i];
+        for (i = 0; i < numDests; i++) demand += network->demand[r][i];
         netLen = 0;
         zoneLen = 0;
         for (ij = 0; ij < network->numArcs; ij++) {
-            if (bushes->flow[ij] == 0) continue;
-            x = bushes->flow[ij] * network->arcs[ij].length;
+            if (flow[ij] == 0) continue;
+            x = flow[ij] * network->arcs[ij].length;
             tail = network->arcs[ij].tail;
             head = network->arcs[ij].head;
             if (tail < network->numZones || head < network->numZones)
@@ -2759,10 +2817,14 @@ void writeOriginVehLength(network_type *network, bushes_type *bushes,
         written++;
     }
     fclose(f);
+    deleteVector(flow);
+    deleteVector(nodeFlow);
 
     for (ij = 0; ij < network->numArcs; ij++)
         aggregate += network->arcs[ij].flow * network->arcs[ij].length;
     displayMessage(LOW_NOTIFICATIONS, "Origin veh-length written: %d origins, "
-                   "%.10g network + %.10g zone-arc veh-length (aggregate link "
-                   "flows: %.10g)\n", written, totNet, totZone, aggregate);
+                   "destinations 1..%d of %d, %.10g network + %.10g zone-arc "
+                   "veh-length (aggregate link flows, all destinations: "
+                   "%.10g)\n", written, numDests, network->numZones, totNet,
+                   totZone, aggregate);
 }

@@ -329,6 +329,7 @@ typedef struct algorithmBParameters_type{
    char     flowsFile[STRING_SIZE];
    char     pathFlowsFile[STRING_SIZE];
    char     originVehLengthFile[STRING_SIZE]; /* IVES FORK: <ORIGIN VEH LENGTH FILE> */
+   int      originVehLengthDests; /* IVES FORK: count destinations 1..n; 0 = all zones */
 } algorithmBParameters_type;
 
 /* Master routine and parameters */

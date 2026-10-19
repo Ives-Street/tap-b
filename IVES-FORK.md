@@ -404,6 +404,7 @@ writes, after convergence, one row per origin (× class, in origin order):
 <NUMBER OF ORIGINS> 24
 <NUMBER OF ZONES> 24
 <NUMBER OF CLASSES> 1
+<DESTINATIONS COUNTED> 24
 <END OF METADATA>
 
 ~	Origin	Class	Demand	VehLength	ZoneArcVehLength	;
@@ -419,11 +420,28 @@ everything lands there. Units are the network file's flow and length units.
 Bush flows are assigned flow alone, so `<PRELOAD FILE>` background flow is
 excluded by construction.
 
-The bush flows come from the same `calculateBushFlows` pass `bushTSTT` runs
+```
+<ORIGIN VEH LENGTH DESTINATIONS> n
+```
+
+restricts each row to the demand bound for destinations 1..n (default: every
+zone). Connectome folds internal-to-external trips (zone → gateway centroid)
+into the same origins' bushes as residents' trips, and numbers analysis zones
+before gateways, so n = analysis zones keeps only the trips Connectome's
+residents make. The restricted flows come from a descending pass that loads
+only that demand and splits it at each merge in the proportions of the bush's
+own approach flows — the proportional decomposition, under which all of an
+origin's destinations share its merge splits. With every zone counted it is
+the pass `calculateBushFlows` makes. Checked against the independent
+`<PATH FLOWS FILE>` decomposition on SiouxFalls with n = 12 of 24: every
+origin agrees to 5e-10 relative (the path file prints flows at `%f`).
+
+The pass costs the same as the `calculateBushFlows` pass `bushTSTT` runs
 every iteration — O(origins × (nodes + arcs)), serial, once. The end-of-run line
 `Origin veh-length written: N origins, A network + B zone-arc veh-length
 (aggregate link flows: C)` reports A + B against the aggregate Σ flow × Length
-so a caller can assert the reconciliation. Measured: A + B = C to all ten
+so a caller can assert the reconciliation (it holds only with every zone
+counted). Measured: A + B = C to all ten
 printed digits on SiouxFalls single-class (24 origins) and two-class (48 rows).
 Single batch only, like `<PATH FLOWS FILE>`.
 

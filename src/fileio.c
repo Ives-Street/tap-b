@@ -70,6 +70,8 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
             /* IVES FORK: per-origin assigned vehicle-length after
              * convergence -- see writeOriginVehLength in bush.c. */
             strcpy(thisRun->originVehLengthFile, metadataValue);
+		} else if (strcmp(metadataTag, "ORIGIN VEH LENGTH DESTINATIONS") == 0) {
+            thisRun->originVehLengthDests = atoi(metadataValue);
 		} else if (strcmp(metadataTag, "GAP FUNCTION") == 0) {
 			if    (strcmp(metadataValue, "RELATIVE GAP") == 0)
 				thisRun->gapFunction = RELATIVE_GAP_1;
