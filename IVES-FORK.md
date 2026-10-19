@@ -387,6 +387,46 @@ freshly-written batch file rather than the previous iteration's — absence is
 cleaner than a mid-convergence snapshot for anything keying a warm-start cache
 on it.
 
+### 13. `src/bush.c`, `src/fileio.c` — per-origin assigned vehicle-length
+
+A reporting output, no change to the solve. Connectome attributes vehicle-miles
+to the residents who drive them, but its trip-based figure prices each OD trip
+at one fastest-path skim distance and so cannot see equilibrium route
+splitting; the bushes can. An opt-in parameters tag,
+
+```
+<ORIGIN VEH LENGTH FILE> origin_vehlen.txt
+```
+
+writes, after convergence, one row per origin (× class, in origin order):
+
+```
+<NUMBER OF ORIGINS> 24
+<NUMBER OF ZONES> 24
+<NUMBER OF CLASSES> 1
+<END OF METADATA>
+
+~	Origin	Class	Demand	VehLength	ZoneArcVehLength	;
+1	1	8800	0	144169.53549175855	;
+```
+
+`VehLength` is Σ over arcs of that origin's bush flow × the arc's `Length`, on
+arcs with neither end at a zone node; `ZoneArcVehLength` is the same sum on
+arcs touching a zone. Under a layout where zones are pure centroids
+(Connectome's export, `<FIRST THRU NODE> = zones + 1`) the second column is
+exactly the centroid connectors; on SiouxFalls, where every node is a zone,
+everything lands there. Units are the network file's flow and length units.
+Bush flows are assigned flow alone, so `<PRELOAD FILE>` background flow is
+excluded by construction.
+
+The bush flows come from the same `calculateBushFlows` pass `bushTSTT` runs
+every iteration — O(origins × (nodes + arcs)), serial, once. The end-of-run line
+`Origin veh-length written: N origins, A network + B zone-arc veh-length
+(aggregate link flows: C)` reports A + B against the aggregate Σ flow × Length
+so a caller can assert the reconciliation. Measured: A + B = C to all ten
+printed digits on SiouxFalls single-class (24 origins) and two-class (48 rows).
+Single batch only, like `<PATH FLOWS FILE>`.
+
 ## Not upstreamed (yet)
 
 The pooled `bushSPTT`, the pooled bush init, the `SRCS`/`SOURCES` Makefile bug,

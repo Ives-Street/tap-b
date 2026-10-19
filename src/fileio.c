@@ -66,6 +66,10 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
             strcpy(thisRun->flowsFile, metadataValue);
 		} else if (strcmp(metadataTag, "PATH FLOWS FILE") == 0) {
             strcpy(thisRun->pathFlowsFile, metadataValue);
+		} else if (strcmp(metadataTag, "ORIGIN VEH LENGTH FILE") == 0) {
+            /* IVES FORK: per-origin assigned vehicle-length after
+             * convergence -- see writeOriginVehLength in bush.c. */
+            strcpy(thisRun->originVehLengthFile, metadataValue);
 		} else if (strcmp(metadataTag, "GAP FUNCTION") == 0) {
 			if    (strcmp(metadataValue, "RELATIVE GAP") == 0)
 				thisRun->gapFunction = RELATIVE_GAP_1;

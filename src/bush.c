@@ -490,6 +490,9 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
     if (strlen(parameters->pathFlowsFile) > 0) {
         writePathFlows(network, bushes, parameters);
     }
+    if (strlen(parameters->originVehLengthFile) > 0) {
+        writeOriginVehLength(network, bushes, parameters);
+    }
     /* Clean up */
     deleteBushes(network, bushes);
     deleteVector(parameters->includedBin);
@@ -583,6 +586,7 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
     parameters.linkShiftB = &exactCostUpdate;
 
     parameters.pathFlowsFile[0] = '\0'; /* By default don't report this */    
+    parameters.originVehLengthFile[0] = '\0'; /* IVES FORK: off by default */
 
     return parameters;
 }
@@ -2693,4 +2697,72 @@ void writePathFlows(network_type *network,
     deleteVector(flowStack);
     deleteVector(mergeStack);
     deleteVector(linkProportion);
+}
+
+/*
+ * IVES FORK: writeOriginVehLength -- <ORIGIN VEH LENGTH FILE>.  For each
+ * origin (one row per origin x class, in origin order), the assigned
+ * vehicle-length its bush carries at the final state: sum over arcs of the
+ * origin's bush flow times the arc's Length, in the network file's flow and
+ * length units.  Bush flows are assigned flow alone, so <PRELOAD FILE>
+ * background flow is excluded by construction.
+ *
+ * The sum is split by arc type: VehLength over arcs with neither end at a
+ * zone node, ZoneArcVehLength over arcs with a zone at either end.  Under a
+ * <FIRST THRU NODE> layout where zones are pure centroids (Connectome's
+ * export) the second column is exactly the centroid connectors.
+ *
+ * Reconciliation: summed over origins, VehLength + ZoneArcVehLength equals
+ * sum(arc flow x Length) on the aggregate link flows to rounding; the line
+ * printed at the end reports both so a caller can assert it.  Single batch
+ * only -- with several batches, only the last batch's bushes are in memory
+ * here (the same restriction as writePathFlows).
+ */
+void writeOriginVehLength(network_type *network, bushes_type *bushes,
+                          algorithmBParameters_type *parameters) {
+    int r, i, ij, tail, head, written = 0;
+    double demand, netLen, zoneLen, x;
+    double totNet = 0, totZone = 0, aggregate = 0;
+
+    if (network->numBatches > 1) {
+        fatalError("writeOriginVehLength does not support multiple batches.");
+    }
+    FILE *f = openFile(parameters->originVehLengthFile, "w");
+    fprintf(f, "<NUMBER OF ORIGINS> %d\n", network->numOrigins);
+    fprintf(f, "<NUMBER OF ZONES> %d\n", network->numZones);
+    fprintf(f, "<NUMBER OF CLASSES> %d\n", network->numClasses);
+    fprintf(f, "<END OF METADATA>\n\n");
+    fprintf(f, "~\tOrigin\tClass\tDemand\tVehLength\tZoneArcVehLength\t;\n");
+
+    for (r = 0; r < network->batchSize; r++) {
+        if (outOfOrigins(network, r) == TRUE) break;
+        calculateBushFlows(r, network, bushes);
+        demand = 0;
+        for (i = 0; i < network->numZones; i++) demand += network->demand[r][i];
+        netLen = 0;
+        zoneLen = 0;
+        for (ij = 0; ij < network->numArcs; ij++) {
+            if (bushes->flow[ij] == 0) continue;
+            x = bushes->flow[ij] * network->arcs[ij].length;
+            tail = network->arcs[ij].tail;
+            head = network->arcs[ij].head;
+            if (tail < network->numZones || head < network->numZones)
+                zoneLen += x;
+            else
+                netLen += x;
+        }
+        fprintf(f, "%d\t%d\t%.17g\t%.17g\t%.17g\t;\n",
+                origin2node(network, r) + 1, origin2class(network, r) + 1,
+                demand, netLen, zoneLen);
+        totNet += netLen;
+        totZone += zoneLen;
+        written++;
+    }
+    fclose(f);
+
+    for (ij = 0; ij < network->numArcs; ij++)
+        aggregate += network->arcs[ij].flow * network->arcs[ij].length;
+    displayMessage(LOW_NOTIFICATIONS, "Origin veh-length written: %d origins, "
+                   "%.10g network + %.10g zone-arc veh-length (aggregate link "
+                   "flows: %.10g)\n", written, totNet, totZone, aggregate);
 }

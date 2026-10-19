@@ -328,6 +328,7 @@ typedef struct algorithmBParameters_type{
    char     matrixStem[STRING_SIZE];
    char     flowsFile[STRING_SIZE];
    char     pathFlowsFile[STRING_SIZE];
+   char     originVehLengthFile[STRING_SIZE]; /* IVES FORK: <ORIGIN VEH LENGTH FILE> */
 } algorithmBParameters_type;
 
 /* Master routine and parameters */
@@ -459,6 +460,8 @@ void writeBushes(network_type *network, bushes_type *bushes, char *filename);
 void readBushes(network_type *network, bushes_type **bushes, char *filename);
 void readBinaryMatrix(network_type *network,
                       algorithmBParameters_type *parameters);
+void writeOriginVehLength(network_type *network, bushes_type *bushes,
+                          algorithmBParameters_type *parameters);
 void writePathFlows(network_type *network,
                     bushes_type *bushes,
                     algorithmBParameters_type *parameters);
