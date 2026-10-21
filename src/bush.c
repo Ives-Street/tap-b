@@ -334,6 +334,10 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
         parameters->includedBin = newVector(parameters->numBins, int);
         parameters->excludedBin = newVector(parameters->numBins, int);
     }
+    /* IVES FORK: per-class convergence report accumulators */
+    parameters->classTSTT = newVector(network->numClasses, double);
+    parameters->classSPTT = newVector(network->numClasses, double);
+    int c;
 
     double elapsedTime = 0, gap = INFINITY, batchGap = INFINITY;
     double entropy = 0, batchEntropy;
@@ -366,6 +370,10 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
         iteration++;
         gap = 0; /* Will accumulate total gap across batches for averaging */
         entropy = 0;
+        for (c = 0; c < network->numClasses; c++) {
+            parameters->classTSTT[c] = 0; /* IVES FORK: per-class report */
+            parameters->classSPTT[c] = 0;
+        }
         clock_gettime(CLOCK_MONOTONIC_RAW, &tick);
         /* Iterate over batches of origins */
         for (batch = 0; batch < network->numBatches; batch++) {
@@ -488,6 +496,23 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
     if (parameters->calculateEntropy == TRUE) {
         displayMessage(FULL_NOTIFICATIONS, "Final entropy: %.15f\n", entropy);
     }
+    /* IVES FORK: per-class convergence report (IVES-FORK.md 15a).  The
+     * aggregate gap above pools every class, so a small class can sit far from
+     * equilibrium while the run "converges".  One line per class, from the
+     * final iteration's gap evaluation (the state the flows file reports):
+     *     CLASS_GAP <class, 1-based> <TSTT> <SPTT> <(TSTT - SPTT) / SPTT>
+     * TSTT and SPTT are generalized cost (time + toll and distance factors) in
+     * that class's own prices.  With several batches the per-batch costs are
+     * the batch-mode estimate, and the tag reads CLASS_GAP_EST. */
+    for (c = 0; c < network->numClasses; c++) {
+        displayMessage(LOW_NOTIFICATIONS, "%s %d %.15g %.15g %.10e\n",
+                       network->numBatches > 1 ? "CLASS_GAP_EST" : "CLASS_GAP",
+                       c + 1, parameters->classTSTT[c],
+                       parameters->classSPTT[c],
+                       parameters->classSPTT[c] == 0 ? 0.0 :
+                       (parameters->classTSTT[c] - parameters->classSPTT[c])
+                           / parameters->classSPTT[c]);
+    }
     /* IVES FORK: the single-batch <STORE BUSHES> write deferred from the
      * loop above -- final state only, which is all the warm-start cache
      * consumes. */
@@ -508,6 +533,10 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
     deleteBushes(network, bushes);
     deleteVector(parameters->includedBin);
     deleteVector(parameters->excludedBin);
+    deleteVector(parameters->classTSTT);
+    deleteVector(parameters->classSPTT);
+    parameters->classTSTT = NULL;
+    parameters->classSPTT = NULL;
 #if PARALLELISM
     thpool_destroy(thpool);
 #endif
@@ -599,6 +628,8 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
     parameters.pathFlowsFile[0] = '\0'; /* By default don't report this */    
     parameters.originVehLengthFile[0] = '\0'; /* IVES FORK: off by default */
     parameters.originVehLengthDests = 0; /* IVES FORK: 0 = all zones */
+    parameters.classTSTT = NULL; /* IVES FORK: allocated by AlgorithmB */
+    parameters.classSPTT = NULL;
 
     return parameters;
 }
@@ -1163,6 +1194,12 @@ double bushSPTT(network_type *network, bushes_type *bushes,
         }
         thpool_wait(thpool);
         for (r = 0; r < nQueued; r++) psptt += args[r].sptt;
+        /* IVES FORK: per-class report -- a separate accumulator, so the
+         * aggregate's summation order (and value) is untouched. */
+        if (parameters->classSPTT != NULL) {
+            for (r = 0; r < nQueued; r++)
+                parameters->classSPTT[origin2class(network, r)] += args[r].sptt;
+        }
         /* IVES FORK: <GAP TIMING>.  These sum per-origin wall times across
          * threads, so they are CPU-seconds, not wall -- their ratio is the
          * split, and their total over the phase's wall time is the achieved
@@ -1204,6 +1241,13 @@ double bushSPTT(network_type *network, bushes_type *bushes,
                             bushes->SPcost, bushes->bushOrder[r]);
         for (j = 0; j < network->numZones; j++) {
             sptt += network->demand[r][j] * bushes->SPcost[j];
+        }
+        if (parameters->classSPTT != NULL) { /* IVES FORK: per-class report */
+            double rsptt = 0;
+            for (j = 0; j < network->numZones; j++) {
+                rsptt += network->demand[r][j] * bushes->SPcost[j];
+            }
+            parameters->classSPTT[c] += rsptt;
         }
         if (parameters->calculateBins == TRUE) {
 #ifdef PARALLELISM
@@ -1278,9 +1322,10 @@ double bushSPTT(network_type *network, bushes_type *bushes,
     displayMessage(FULL_DEBUG, "%f", frac); 
 }
 
-double bushTSTT(network_type *network, bushes_type *bushes) {
+double bushTSTT(network_type *network, bushes_type *bushes,
+                double *classTSTT) {
     int r, ij, c, lastClass = IS_MISSING;
-    double tstt = 0;
+    double tstt = 0, rtstt;
     for (r = 0; r < network->batchSize; r++) {
         if (outOfOrigins(network, r) == TRUE) break;
         c = origin2class(network, r);
@@ -1288,12 +1333,30 @@ double bushTSTT(network_type *network, bushes_type *bushes) {
             changeFixedCosts(network, c);
         }
         calculateBushFlows(r, network, bushes);
+        rtstt = 0; /* IVES FORK: per-class report, separate accumulator */
         for (ij = 0; ij < network->numArcs; ij++) {
             tstt += bushes->flow[ij] * network->arcs[ij].cost;
+            rtstt += bushes->flow[ij] * network->arcs[ij].cost;
         }
+        if (classTSTT != NULL) classTSTT[c] += rtstt;
         lastClass = c;
     }
     return tstt;
+}
+
+/* IVES FORK: TSTT(network) with each class's term kept (per-class report).
+ * The same calls in the same order as TSTT in tap.c, so the aggregate it
+ * returns is bit-identical. */
+static double TSTTByClass(network_type *network, double *classTSTT) {
+    double sum = 0, term;
+    int c;
+    for (c = 0; c < network->numClasses; c++) {
+        term = classGeneralizedCost(network, c);
+        sum += term;
+        if (classTSTT != NULL) classTSTT[c] += term;
+    }
+    if (isnan(sum)) displayNetwork(DEBUG, network);
+    return sum;
 }
 
 double bushRelativeGap(network_type *network, bushes_type *bushes,
@@ -1314,8 +1377,8 @@ double bushRelativeGap(network_type *network, bushes_type *bushes,
         clock_gettime(CLOCK_MONOTONIC_RAW, &tT0);
     }
     double tstt = network->numBatches == 1 ?
-                                         TSTT(network) :
-                                         bushTSTT(network, bushes);
+                         TSTTByClass(network, parameters->classTSTT) :
+                         bushTSTT(network, bushes, parameters->classTSTT);
     if (parameters->gapTiming) {
         clock_gettime(CLOCK_MONOTONIC_RAW, &tT1);
         parameters->gapTSTTTime = (double)(tT1.tv_sec - tT0.tv_sec)

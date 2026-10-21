@@ -330,6 +330,13 @@ typedef struct algorithmBParameters_type{
    char     pathFlowsFile[STRING_SIZE];
    char     originVehLengthFile[STRING_SIZE]; /* IVES FORK: <ORIGIN VEH LENGTH FILE> */
    int      originVehLengthDests; /* IVES FORK: count destinations 1..n; 0 = all zones */
+   /* IVES FORK: per-class convergence report (IVES-FORK.md 15a).  [class]
+      vectors, allocated by AlgorithmB, zeroed at the start of each iteration
+      and accumulated over its batches by bushRelativeGap, so after the loop
+      they hold the final iteration's per-class TSTT and SPTT.  NULL outside
+      AlgorithmB, where nothing accumulates. */
+   double   *classTSTT;
+   double   *classSPTT;
 } algorithmBParameters_type;
 
 /* Master routine and parameters */
@@ -357,7 +364,7 @@ bool updateFlowsB(int origin, network_type *network, bushes_type *bushes,
 /* Custom gap routines using bushes */
 double bushSPTT(network_type *network, bushes_type *bushes, 
               algorithmBParameters_type *parameters);
-double bushTSTT(network_type *network, bushes_type *bushes);
+double bushTSTT(network_type *network, bushes_type *bushes, double *classTSTT);
 double bushRelativeGap(network_type *network, bushes_type *bushes,
               algorithmBParameters_type *parameters);
 double bushEntropy(network_type *network, bushes_type *bushes,
