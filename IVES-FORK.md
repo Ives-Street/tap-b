@@ -13,7 +13,8 @@ bush-update scan is `LONGEST_BUSH_PATH`, because the upstream default can build
 a cyclic bush and crash (section 10); and multi-class runs no longer switch one
 class's tolls in under another class's queued work (section 14). Section 16 is
 a memory fix: the parallel build's scratch is per worker thread, not per
-origin.
+origin. Section 17 is a second input feature: an optional per-class toll on
+every link, the seam an exempt class (HOV) will use.
 
 **Base commit:** `040135a20c771fbb84766df6a97cff981fa5df4b` (upstream `master`,
 2024-09-22). **Our branch:** `ives/main`. Upstream stays as the `upstream`
@@ -655,7 +656,9 @@ explanation is an unproven hypothesis: it reads as convergence-tolerance spread
 Connectome environment — and shares no code with tap-b. Per class it evaluates
 `cost_k(a) = t_a(x_a + p_a) + tollFactor_k · toll_a + distanceFactor_k ·
 length_a` on the flows tap-b wrote (`p` = the `<PRELOAD FILE>` flow, with
-`--preload`; it enters only the travel time, as in section 6), runs Dijkstra
+`--preload`; it enters only the travel time, as in section 6; with
+`--class-toll`, `toll_a` is class k's column of the `<CLASS TOLL FILE>`,
+section 17), runs Dijkstra
 from every origin (zones below `<FIRST THRU NODE>` are not passed through),
 and reports `(TSTT_k − SPTT_k) / SPTT_k`. Its stated assumptions:
 
@@ -788,6 +791,163 @@ less sensitive to other tenants, is flat or lower: 333 vs 324 s, 1,108 vs
 1,130 s, 1,358 vs 1,370 s; iterations equal (11/10, 18/18, 17/17). No
 regression is attributable beyond the noise.
 
+### 17. `src/fileio.c` — per-class link tolls, `<CLASS TOLL FILE>`
+
+Upstream's multi-class model gives every class the same toll on a link — the
+network file's `Toll` column — and lets classes differ only in how they weigh
+it (`<TOLL FACTOR>`, minutes per dollar). That cannot say "this class is
+exempt here and pays there", which is what an HOV class on a mixed HOT/toll
+network needs. The arc struct already has the slot: `classToll[c]`, which
+`readOBANetwork` fills with the `Toll` column for every class and from which
+`finalizeNetwork` precomputes each class's fixed cost,
+
+```
+classCost[c] = distanceFactor_c × length + tollFactor_c × classToll[c]
+```
+
+that `changeFixedCosts(c)` (§14) swaps into the shared `fixedCost`. Nothing
+upstream ever writes `classToll` with anything else. A new optional parameter
+does:
+
+```
+<CLASS TOLL FILE> mynet_classtoll.txt
+```
+
+resolved against `<FILE PATH>` like the network, trips and preload files.
+Without the tag nothing changes: every class pays the `Toll` column, as
+before.
+
+**Format.** Positional, like the `<PRELOAD FILE>` (§6): one row per link in
+network-file order, its `(tail, head)` verified against the arc it lands on,
+then one toll column per class, in parameters-file `<TRIPS FILE>` order.
+Tolls are in the `Toll` column's units (dollars); each class's `<TOLL FACTOR>`
+converts them to minutes exactly as it converts the `Toll` column.
+
+```
+<NUMBER OF LINKS> 76
+<NUMBER OF CLASSES> 2
+<END OF METADATA>
+~ Init Term Class1 Class2 ;
+1 2 0 0 ;
+8 16 5 0 ;
+```
+
+Both metadata tags are required. Blank lines and `~` comment lines are skipped
+anywhere; a data row ends at its first `;` (the `;` is optional); fields are
+whitespace-separated. The file *replaces* `classToll[c]` on every real arc
+for every class — there is no "missing value means the Toll column": a class
+that should pay the Toll column gets the Toll column written out.
+
+**Validation — every mismatch is fatal**, with the file name, the row and the
+offending line in the message (tap-b exits 1):
+
+- `<NUMBER OF LINKS>` missing or ≠ the network's link count;
+- `<NUMBER OF CLASSES>` missing or ≠ the number of `<TRIPS FILE>`s;
+- fewer data rows than links (`ended … after N of M links`), or any data row
+  after the last link (`has data after its M links`);
+- a row whose `(tail, head)` is not the arc it lands on (`misaligned with the
+  network at row R`) — a shifted, re-sorted or other network's file;
+- a row whose toll column count is not the class count;
+- a field that does not parse in full, or a toll that is not finite (`nan`,
+  `inf`).
+
+Negative tolls are accepted, as they are in the network file's `Toll` column
+(which only warns, at full verbosity); the class toll reader counts them and
+warns once at `LOW_NOTIFICATIONS`. Loading prints the prove-it-fired lines
+
+```
+Class tolls loaded: 76 links x 2 classes from ./mynet_classtoll.txt.
+Class 1 tolls: 16 links nonzero, 0 differ from the network Toll column.
+Class 2 tolls: 8 links nonzero, 8 differ from the network Toll column.
+```
+
+(none contains `Iteration` or the other markers Connectome's log parser keys
+on).
+
+**Where it enters.** `readClassTollFile` runs in `readParametersFile` right
+after the preload — after `readOBANetwork`, before `AlgorithmB`'s
+`makeStronglyConnectedNetwork` — so the rows are matched against the real
+arcs only. It writes `classToll[c]` and recomputes `classCost[c]` with
+`finalizeNetwork`'s expression, term for term, so a file equal to the `Toll`
+column reproduces `classCost` bit for bit. `arc.toll` (the `Toll` column) is
+left as read; `writeOBANetwork` still echoes it. **Artificial arcs** are not
+in the file (it covers the network file's links, in exported order); they are
+created afterwards with `classToll[c] = 0` (upstream's "protect revenue"), and
+the `finalizeNetwork` that `makeStronglyConnectedNetwork` re-runs recomputes
+every arc's `classCost` from `classToll`, so the file's values survive it.
+`classToll` also drives the per-class revenue (`classRevenue`, the `Toll`
+column of `writeMulticlassFlows`' summary block), so revenue follows the
+file: an exempt class's trips on a link pay nothing there.
+
+**Tests** (`make check` / `check-quick`; fixtures from `make_fixtures.py`,
+over the 76 links of the tolled SiouxFalls of §14):
+
+- `SF_ct_exempt` — the HOV-exempt pattern. Class 1 (0.5 min/$) pays the `Toll`
+  column; class 2 (4 min/$) is exempt on the 8 tolled links incident to node 16
+  and pays $5 on the 8 incident only to node 10. Per-class oracle gate 1e-8
+  (solve 1e-9). At 1 thread: oracle 3.04e-10 / 2.06e-10, tap-b `CLASS_GAP`
+  3.07e-10 / 2.02e-10; at 12 threads 3.85e-10 / 5.40e-10. Total flows within
+  2.2e-3 veh of the serial build.
+- `SF_ct_same2` — a 2-class file equal to the `Toll` column: flows file
+  byte-identical to the same run without the tag (1 thread).
+- `SF_ct_same1` — the single-class equivalent on stock SiouxFalls: flows
+  byte-identical to the committed `SiouxFalls` golden.
+- `SF_ct_zero2` — class 2 (4 min/$) zeroed everywhere by the file routes as a
+  toll-factor-0 class: every link row byte-identical to the 2-class run with
+  the `free` trips file (0 min/$) in its place. Only the summary block differs,
+  and must: the `free` class still pays the `Toll` column (at zero weight),
+  the zeroed class pays nothing (class 2 revenue 1,244,075.875 vs 0). This is
+  the test that the file is applied per class rather than ignored — the two
+  identity tests above would pass on a binary that never read it.
+- `SF_ct_bad_{count,short,extra,swapped,cols,classes,nan}` — seven malformed
+  variants of `ct_same2`, each one defect away from it (stated 75 links; 75
+  rows; 77 rows; row 22 written `(16,8)`; row 30 with three toll columns;
+  `<NUMBER OF CLASSES> 3`; a `nan`). Each must exit nonzero *and* print its
+  expected message.
+- Every case that passes the tag also fails if the log lacks `Class tolls
+  loaded`.
+
+**The oracle** learns the file: `mcgap.py … --class-toll FILE` reads it
+(positional, `(tail, head)` verified, column and row counts checked) and
+prices class k at `tollFactor_k × classToll_k(a)`; without it, the `Toll`
+column for every class, as before. Validated on the `SF_ct_exempt` flows
+before it gated anything:
+
+| check | class 1 gap | class 2 gap |
+|---|---|---|
+| oracle with `--class-toll` | 3.0447e-10 | 2.0592e-10 |
+| tap-b's own `CLASS_GAP` (independent code) | 3.0656e-10 | 2.0234e-10 |
+| oracle **without** `--class-toll`, same flows | 3.0447e-10 | **4.15e-3** |
+| no-file equilibrium judged under the exempt tolls | 7.14e-10 | **5.18e-3** |
+| no-file flows, oracle with a `Toll`-equal file vs without | identical to all printed digits | identical |
+
+Class 2's TSTT agrees with tap-b's to ~2e-12 relative (64,181,396.1243 vs
+.1244). The extension does the work (row 3), and the file moves the
+equilibrium (row 4).
+
+**Pattern, not built in: the soft ban.** A class can be kept off a link by
+charging it a large *finite* toll there — never `ARTIFICIAL`. On tolled
+SiouxFalls, $1,000 for class 2 (4 min/$, i.e. 4,000 min) on (10,16) and
+(16,10) takes class 2's flow there from ~8,800 veh to 0.000000 while class 1
+absorbs the links (gaps 8.7e-10 / 7.2e-10, oracle agreeing). Three cautions:
+
+- It is soft. If a class has no other path, it still uses the link and pays;
+  the charge then dominates that class's generalized cost and its revenue
+  line (`classRevenue` counts it as toll paid). A hard prohibition would be a
+  per-class link ban, which is a behaviour change this fork has not made.
+- Keep `tollFactor_c × charge` far below `ARTIFICIAL` (99,999 min). Artificial
+  arcs cost ~99,999 min of travel time, so a charge whose minutes approach that
+  makes a detour through the artificial connector node competitive, and the
+  class's flow goes onto arcs the flows file reports as artificial — wrong in a
+  way that still converges. Charge enough to exceed any plausible detour (a
+  few times the longest OD path's cost), no more.
+- Never `ARTIFICIAL` itself, or `inf` (refused at load): the gap and the
+  revenue are sums of `flow × cost`, so a sentinel-sized charge on even a
+  sliver of residual flow swamps them.
+
+Connectome does not use this pattern; it is documented for the future HOV
+work only.
+
 ## Not upstreamed (yet)
 
 The pooled `bushSPTT`, the pooled bush init, the `SRCS`/`SOURCES` Makefile bug,
@@ -797,7 +957,7 @@ write them against upstream's current `develop`. The cycle fix (section 10) is
 the one upstream most needs — they have hit this class of bug twice — but it
 changes their default, so it would need the conversation, not just the patch. The dialect pin and the bins
 default are opinionated and probably belong to us. The preload is a feature
-upstream may or may not want; we would offer it. The class-switch race (section 14) is a bug in
+upstream may or may not want; we would offer it, and the class toll file (section 17) with it. The class-switch race (section 14) is a bug in
 upstream `master` that `develop` has already fixed structurally; at most it is
 a bug report against `master`, not a patch.
 
