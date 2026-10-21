@@ -405,6 +405,17 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
                 bfCountersReset();
             }
             batchGap = bushRelativeGap(network, bushes, parameters);
+            /* IVES FORK: the gap evaluation switches class costs itself
+             * (bushSPTT, and TSTT via classGeneralizedCost) and leaves the
+             * network on the last class's costs, but never told lastClass.
+             * When the last origin updateBatchFlows touched belonged to an
+             * earlier class -- e.g. the last class's bushes had all converged
+             * -- the next iteration's first class reused the last class's
+             * tolls.  Forget the class so the next dispatch re-applies it.
+             * Re-applying the class already in place is an exact no-op
+             * (cost += fixedCost - fixedCost), so single-class runs are
+             * bit-identical (IVES-FORK.md 14). */
+            lastClass = IS_MISSING;
             if (parameters->gapTiming) {
                 clock_gettime(CLOCK_MONOTONIC_RAW, &gapTock);
                 getrusage(RUSAGE_SELF, &ruAfter);
