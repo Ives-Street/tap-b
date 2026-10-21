@@ -8,7 +8,7 @@ own convergence report rather than repeat it.
 
 For each class k (one per <TRIPS FILE>, in parameters-file order):
 
-    cost_k(a) = t_a(x_a + p_a) + tollFactor_k * toll_a + distFactor_k * length_a
+    cost_k(a) = t_a(x_a + p_a) + tollFactor_k * toll_k(a) + distFactor_k * length_a
 
   x_a   total assigned flow on arc a (all classes), from the flows file
   p_a   <PRELOAD FILE> background flow on a (0 without --preload); it enters
@@ -16,6 +16,9 @@ For each class k (one per <TRIPS FILE>, in parameters-file order):
   t_a   BPR: fft * (1 + B * ((x + p) / cap) ** power)
   tollFactor_k / distFactor_k   the trips file's <TOLL FACTOR> / <DISTANCE
         FACTOR>, defaulting to the network file's (as tap-b does)
+  toll_k(a)   class k's column of the <CLASS TOLL FILE> (with --class-toll,
+        IVES-FORK.md 17); without it, the network file's Toll column for
+        every class
 
   TSTT_k = sum_a x^k_a * cost_k(a)           (class-k flow, real arcs)
   SPTT_k = sum_od d^k_od * shortest_k(o, d)  (Dijkstra on cost_k; zone nodes
@@ -34,7 +37,8 @@ Assumptions, stated because each one could make the check wrong:
     so there the assumption is not checked.  An unreachable OD pair is an error.
   * Arc identity is positional: the i-th real row of the flows file is the
     i-th link of the network file (repeated (tail, head) pairs are matched in
-    order), and the preload file's rows are verified against (tail, head).
+    order), and the preload and class-toll files' rows are verified against
+    (tail, head), with one class-toll column per trips file.
   * BPR only.  Every arc is evaluated with the BPR form above (all TNTP test
     networks and Connectome's export use it).
   * Demand is read as written; <DEMAND MULTIPLIER> is not applied.
@@ -42,7 +46,8 @@ Assumptions, stated because each one could make the check wrong:
     carries that rounding (~1e-11 relative on the L1 networks).
 
 Usage:
-    mcgap.py NET FLOWS TRIPS [TRIPS ...] [--preload FILE] [--max-gap G]
+    mcgap.py NET FLOWS TRIPS [TRIPS ...] [--preload FILE]
+             [--class-toll FILE] [--max-gap G]
 
 Prints one human-readable line and one parseable line per class:
     ORACLE_CLASS_GAP <class 1-based> <TSTT> <SPTT> <gap>
@@ -125,6 +130,44 @@ def read_preload(path, arcs):
     return p
 
 
+def read_class_toll(path, arcs, ncls):
+    """Per-class toll vectors from a <CLASS TOLL FILE>: positional rows
+    (tail, head, toll_1 .. toll_ncls), verified like the preload's."""
+    cols, k, meta, in_data = [[] for _ in range(ncls)], 0, {}, False
+    with open(path) as f:
+        for line in f:
+            m = _META.match(line)
+            if m and not in_data:
+                meta[m.group(1).strip()] = m.group(2).strip()
+                if m.group(1).strip() == "END OF METADATA":
+                    in_data = True
+                continue
+            s = line.strip()
+            if not in_data or not s or s.startswith("~"):
+                continue
+            t = s.split(";")[0].split()
+            if len(t) != 2 + ncls:
+                sys.exit("class toll row %d has %d toll columns, %d classes"
+                         % (k + 1, len(t) - 2, ncls))
+            if k >= len(arcs):
+                sys.exit("class toll file has more rows than the network's "
+                         "%d links" % len(arcs))
+            if (int(t[0]), int(t[1])) != arcs[k][:2]:
+                sys.exit("class toll row %d is (%s,%s), network link is "
+                         "(%d,%d)" % (k + 1, t[0], t[1], arcs[k][0],
+                                      arcs[k][1]))
+            for c in range(ncls):
+                cols[c].append(float(t[2 + c]))
+            k += 1
+    if k != len(arcs):
+        sys.exit("class toll file has %d rows, network has %d"
+                 % (k, len(arcs)))
+    if int(meta.get("NUMBER OF CLASSES", -1)) != ncls:
+        sys.exit("class toll file states %s classes, %d trips files"
+                 % (meta.get("NUMBER OF CLASSES"), ncls))
+    return cols
+
+
 def read_trips(path):
     txt = open(path).read()
     meta = dict((m.group(1).strip(), m.group(2).strip())
@@ -150,6 +193,7 @@ def main():
     ap.add_argument("flows")
     ap.add_argument("trips", nargs="+")
     ap.add_argument("--preload")
+    ap.add_argument("--class-toll")
     ap.add_argument("--max-gap", type=float)
     a = ap.parse_args()
 
@@ -160,6 +204,8 @@ def main():
     flows = read_flows(a.flows, arcs)
     pre = read_preload(a.preload, arcs) if a.preload else [0.0] * len(arcs)
     ncls = len(a.trips)
+    ctoll = (read_class_toll(a.class_toll, arcs, ncls) if a.class_toll
+             else [[arc[7] for arc in arcs]] * ncls)
     time = [bpr(arcs[i], flows[i][0] + pre[i]) for i in range(len(arcs))]
     adj = collections.defaultdict(list)
     for i, arc in enumerate(arcs):
@@ -171,7 +217,8 @@ def main():
         tf = float(tmeta["TOLL FACTOR"]) if "TOLL FACTOR" in tmeta else tf0
         df = (float(tmeta["DISTANCE FACTOR"]) if "DISTANCE FACTOR" in tmeta
               else df0)
-        cost = [time[i] + tf * arcs[i][7] + df * arcs[i][3]
+        toll = ctoll[c]
+        cost = [time[i] + tf * toll[i] + df * arcs[i][3]
                 for i in range(len(arcs))]
         # multi-class rows: (t,h) total time class1 class2 ...; single: (t,h) x
         col = 2 + c if ncls > 1 else 0
@@ -204,7 +251,7 @@ def main():
                     dem += v
         gap = (tstt - sptt) / sptt
         worst = max(worst, gap)
-        tolled = sum(xk[i] for i in range(len(arcs)) if arcs[i][7] > 0)
+        tolled = sum(xk[i] for i in range(len(arcs)) if toll[i] > 0)
         print("class%d tollF=%g distF=%g demand=%.1f TSTT=%.10g SPTT=%.10g "
               "relgap=%.3e flow_on_tolled=%.1f"
               % (c + 1, tf, df, dem, tstt, sptt, gap, tolled))

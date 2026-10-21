@@ -15,6 +15,7 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
 	char filePath[STRING_SIZE], dataPath[STRING_SIZE];
 	char networkFileName[STRING_SIZE];
 	char preloadFileName[STRING_SIZE]; /* IVES FORK */
+	char classTollFileName[STRING_SIZE]; /* IVES FORK */
 	stringList_type *tripsFile = NULL, *newTripsFile = NULL;
 	char metadataTag[STRING_SIZE], metadataValue[STRING_SIZE];
 	FILE *parametersFile = openFile(filename, "r");
@@ -31,6 +32,8 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
        here. */
     networkFileName[0] = '\0';
     preloadFileName[0] = '\0'; /* IVES FORK: optional, absent means no preload */
+    classTollFileName[0] = '\0'; /* IVES FORK: optional, absent means every
+                                    class pays the network Toll column */
     strcpy(filePath, "net/");
     strcpy(dataPath, "net/");
     strcpy(thisRun->flowsFile, "flows.txt");
@@ -48,6 +51,10 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
             /* IVES FORK: per-link fixed background flow (see
                readPreloadFile).  Optional; absent means no preload. */
 			strcpy(preloadFileName, metadataValue);
+		} else if (strcmp(metadataTag, "CLASS TOLL FILE") == 0) {
+            /* IVES FORK: per-class, per-link tolls (see readClassTollFile).
+               Optional; absent means every class pays the Toll column. */
+			strcpy(classTollFileName, metadataValue);
 		} else if (strcmp(metadataTag, "TRIPS FILE") == 0) {
 			newTripsFile = newScalar(stringList_type);
             strcpy(newTripsFile->string, metadataValue);
@@ -277,6 +284,14 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
         snprintf(fullLine, 2*STRING_SIZE, "%s%s", filePath, preloadFileName);
         mystrncpy(preloadFileName, fullLine, STRING_SIZE - 1);
         readPreloadFile(network, preloadFileName);
+    }
+    /* IVES FORK: per-class tolls, if any.  Same placement and for the same
+       reason as the preload: rows are matched against the real arcs, before
+       AlgorithmB appends artificial ones (which carry class toll 0, tap.c). */
+    if (strlen(classTollFileName) > 0) {
+        snprintf(fullLine, 2*STRING_SIZE, "%s%s", filePath, classTollFileName);
+        mystrncpy(classTollFileName, fullLine, STRING_SIZE - 1);
+        readClassTollFile(network, classTollFileName);
     }
     if (thisRun->storeMatrices == TRUE) {
         writeBinaryMatrices(network, thisRun->matrixStem);
@@ -702,6 +717,174 @@ void readPreloadFile(network_type *network, char *preloadFileName) {
     displayMessage(LOW_NOTIFICATIONS,
                    "Preload loaded: %d of %d links carrying background flow, "
                    "%.6g veh total.\n", nonzero, network->numArcs, total);
+}
+
+/*
+ * IVES FORK: readClassTollFile -- per-class, per-link tolls (IVES-FORK.md 17).
+ *
+ * Reads a file of the form
+ *
+ *     <NUMBER OF LINKS> 76
+ *     <NUMBER OF CLASSES> 2
+ *     <END OF METADATA>
+ *     ~ Init Term Class1 Class2 ;
+ *     1 2 0 0 ;
+ *     ...
+ *
+ * with exactly one data row per link, in network-file order (positional, like
+ * the <PRELOAD FILE>; the row's (tail, head) is verified, not used as a key),
+ * and one toll column per class, in parameters-file <TRIPS FILE> order.  Tolls
+ * are in the network Toll column's units (dollars); each class's <TOLL
+ * FACTOR> converts them to minutes exactly as it does the Toll column.
+ *
+ * The file replaces arc.classToll[c], which readOBANetwork set to the Toll
+ * column for every class; classCost[c] is then recomputed with the same
+ * expression as finalizeNetwork, which makeStronglyConnectedNetwork re-runs
+ * (from classToll) after appending artificial arcs.  arc.toll -- the Toll
+ * column, echoed by writeOBANetwork -- is left as read.
+ *
+ * Every mismatch is fatal: stated link or class count, a missing or extra data
+ * row, a row whose (tail, head) is not the arc it lands on, a row whose toll
+ * column count is not the number of classes, an unparseable or non-finite
+ * value.  Must be called after readOBANetwork and before
+ * makeStronglyConnectedNetwork, i.e. while numArcs is the real link count.
+ */
+void readClassTollFile(network_type *network, char *classTollFileName) {
+    int i, c, tail, head, status, numTokens;
+    int statedLinks = IS_MISSING, statedClasses = IS_MISSING;
+    int numClasses = network->numClasses;
+    int negative = 0;
+    char fullLine[STRING_SIZE], trimmedLine[STRING_SIZE];
+    char rowCopy[STRING_SIZE];
+    char metadataTag[STRING_SIZE], metadataValue[STRING_SIZE];
+    char *token, *end, *semicolon;
+    double value;
+    FILE *tollFile = openFile(classTollFileName, "r");
+    declareVector(double, rowToll, numClasses);
+    declareVector(int, differ, numClasses);
+    declareVector(int, tolled, numClasses);
+    for (c = 0; c < numClasses; c++) differ[c] = tolled[c] = 0;
+
+    bool endofMetadata = FALSE;
+    do {
+        if (fgets(fullLine, STRING_SIZE, tollFile) == NULL)
+            fatalError("Class toll file %s ended (or other I/O error) before "
+                       "metadata complete.", classTollFileName);
+        status = parseMetadata(fullLine, metadataTag, metadataValue);
+        if (status == BLANK_LINE || status == COMMENT) continue;
+        if        (strcmp(metadataTag, "NUMBER OF LINKS") == 0) {
+            statedLinks = atoi(metadataValue);
+        } else if (strcmp(metadataTag, "NUMBER OF CLASSES") == 0) {
+            statedClasses = atoi(metadataValue);
+        } else if (strcmp(metadataTag, "END OF METADATA") == 0) {
+            endofMetadata = TRUE;
+        } else {
+            warning(MEDIUM_NOTIFICATIONS, "Ignoring unknown metadata tag %s "
+                    "in class toll file %s", metadataTag, classTollFileName);
+        }
+    } while (endofMetadata == FALSE);
+
+    if (statedLinks == IS_MISSING)
+        fatalError("Class toll file %s does not state the number of links.",
+                   classTollFileName);
+    if (statedLinks != network->numArcs)
+        fatalError("Class toll file %s covers %d links but the network has "
+                   "%d. The class toll file is positional -- it must be "
+                   "written for this network.", classTollFileName,
+                   statedLinks, network->numArcs);
+    if (statedClasses == IS_MISSING)
+        fatalError("Class toll file %s does not state the number of classes.",
+                   classTollFileName);
+    if (statedClasses != numClasses)
+        fatalError("Class toll file %s has %d classes but the parameters file "
+                   "gives %d trips files. One toll column per class, in "
+                   "trips-file order.", classTollFileName, statedClasses,
+                   numClasses);
+
+    for (i = 0; i < network->numArcs; i++) {
+        if (fgets(fullLine, STRING_SIZE, tollFile) == NULL)
+            fatalError("Class toll file %s ended (or other I/O error) after %d "
+                       "of %d links.", classTollFileName, i, network->numArcs);
+        status = parseLine(fullLine, trimmedLine);
+        if (status == BLANK_LINE || status == COMMENT) {
+            i--;
+            continue;
+        }
+        /* The row ends at the first ';' (or the end of the line). */
+        mystrncpy(rowCopy, trimmedLine, STRING_SIZE - 1);
+        rowCopy[strcspn(rowCopy, "\r\n")] = '\0';
+        semicolon = strchr(trimmedLine, ';');
+        if (semicolon != NULL) *semicolon = '\0';
+        numTokens = 0;
+        tail = head = 0;
+        for (token = strtok(trimmedLine, " \t\r\n"); token != NULL;
+                token = strtok(NULL, " \t\r\n")) {
+            if (numTokens < 2) {
+                long v = strtol(token, &end, 10);
+                if (*end != '\0')
+                    fatalError("Class toll file %s, row %d: \"%s\" is not a "
+                               "node number:\n\"%s\"", classTollFileName,
+                               i + 1, token, rowCopy);
+                if (numTokens == 0) tail = (int) v; else head = (int) v;
+            } else {
+                value = strtod(token, &end);
+                if (*end != '\0' || !isfinite(value))
+                    fatalError("Class toll file %s, row %d: \"%s\" is not a "
+                               "finite toll:\n\"%s\"", classTollFileName,
+                               i + 1, token, rowCopy);
+                if (numTokens - 2 < numClasses)
+                    rowToll[numTokens - 2] = value;
+            }
+            numTokens++;
+        }
+        if (numTokens != 2 + numClasses)
+            fatalError("Class toll file %s, row %d has %d toll columns; the "
+                       "run has %d classes (one column per trips file):\n"
+                       "\"%s\"", classTollFileName, i + 1,
+                       numTokens < 2 ? 0 : numTokens - 2, numClasses, rowCopy);
+        if (tail - 1 != network->arcs[i].tail
+                || head - 1 != network->arcs[i].head)
+            fatalError("Class toll file %s is misaligned with the network at "
+                       "row %d: the file has (%d,%d), the network has (%d,%d). "
+                       "Class toll rows must be in network-file link order.",
+                       classTollFileName, i + 1, tail, head,
+                       network->arcs[i].tail + 1, network->arcs[i].head + 1);
+        for (c = 0; c < numClasses; c++) {
+            if (rowToll[c] < 0) negative++;
+            if (rowToll[c] != network->arcs[i].toll) differ[c]++;
+            if (rowToll[c] != 0) tolled[c]++;
+            network->arcs[i].classToll[c] = rowToll[c];
+            /* The expression of finalizeNetwork, so a file equal to the Toll
+               column reproduces classCost bit for bit. */
+            network->arcs[i].classCost[c] =
+                network->arcs[i].length * network->distanceFactor[c]
+                + network->arcs[i].classToll[c] * network->tollFactor[c];
+        }
+    }
+    /* Anything but blank lines and comments after the last link is a row too
+       many: the file was written for a different network or shifted. */
+    while (fgets(fullLine, STRING_SIZE, tollFile) != NULL) {
+        status = parseLine(fullLine, trimmedLine);
+        if (status == BLANK_LINE || status == COMMENT) continue;
+        fatalError("Class toll file %s has data after its %d links:\n\"%s\"",
+                   classTollFileName, network->numArcs, fullLine);
+    }
+    fclose(tollFile);
+
+    if (negative > 0)
+        warning(LOW_NOTIFICATIONS, "Class toll file %s has %d negative "
+                "(link, class) tolls.\n", classTollFileName, negative);
+    /* Prove-it-fired line, as for the preload. */
+    displayMessage(LOW_NOTIFICATIONS, "Class tolls loaded: %d links x %d "
+                   "classes from %s.\n", network->numArcs, numClasses,
+                   classTollFileName);
+    for (c = 0; c < numClasses; c++)
+        displayMessage(LOW_NOTIFICATIONS, "Class %d tolls: %d links nonzero, "
+                       "%d differ from the network Toll column.\n", c + 1,
+                       tolled[c], differ[c]);
+    deleteVector(rowToll);
+    deleteVector(differ);
+    deleteVector(tolled);
 }
 
 /*

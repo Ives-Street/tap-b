@@ -24,6 +24,22 @@ Fixtures (IVES-FORK.md sections 14-15):
   Preloads (the fork's standing with/without-preload check, section 2)
     <Net>_preload10.txt         10 % of each link's capacity, positional rows
 
+  Class toll files (<CLASS TOLL FILE>, section 17), over the 76 SiouxFalls
+  links; "Toll" is the tolled network's Toll column, copied as written
+    SiouxFalls_ct_exempt.txt    2 classes: class 1 Toll; class 2 Toll but 0 on
+                                the 8 tolled links incident to node 16 (the
+                                HOV-exempt pattern; the 8 incident only to
+                                node 10 still charge $5)
+    SiouxFalls_ct_same2.txt     2 classes, both = Toll  (identity check)
+    SiouxFalls_ct_zero2.txt     class 1 Toll, class 2 zero everywhere
+                                (equivalence with a toll-factor-0 class)
+    SiouxFalls_ct_same1.txt     1 class = the stock network's Toll column
+    SiouxFalls_ct_bad_*.txt     malformed variants of ct_same2 that tap-b must
+                                refuse: count (stated 75 links), short (75 rows),
+                                extra (77 rows), swapped (row 22 as (16,8)),
+                                cols (row 30 with 3 toll columns), classes
+                                (<NUMBER OF CLASSES> 3), nan (a non-finite toll)
+
 Usage: make_fixtures.py [--net NETDIR] [--out OUTDIR] [--no-chicago]
 """
 import argparse
@@ -41,6 +57,9 @@ CHI_SPLITS = [("h2lo", 2, "2"), ("h2hi", 2, "10"),
 PRELOAD_NETS = ["SiouxFalls", "Braess", "Anaheim", "ChicagoSketch",
                 "Barcelona"]
 PRELOAD_SHARE = 0.10
+# Class-toll exemption: class 2 pays nothing on the tolled links incident to
+# this node.
+CT_EXEMPT_NODE = "16"
 
 
 def read_text(path):
@@ -117,6 +136,66 @@ def preload(netdir, out, net):
         g.write("\n".join(res) + "\n")
 
 
+def _network_links(path):
+    lines = read_text(path).split("\n")
+    return [lines[k].split()[:2] + [lines[k].split()[8]]
+            for k in link_rows(lines)]
+
+
+def _write_class_toll(path, links, cols, nlinks=None, nclasses=None):
+    """cols: one list of toll strings per class, one entry per link."""
+    res = ["<NUMBER OF LINKS> %d" % (len(links) if nlinks is None else nlinks),
+           "<NUMBER OF CLASSES> %d" % (len(cols) if nclasses is None
+                                       else nclasses),
+           "<END OF METADATA>",
+           "~ Init Term " + " ".join("Class%d" % (c + 1)
+                                     for c in range(len(cols))) + " ;"]
+    for i, (t, h, _toll) in enumerate(links):
+        res.append(" ".join([t, h] + [col[i] for col in cols]) + " ;")
+    with open(path, "w") as g:
+        g.write("\n".join(res) + "\n")
+    return res
+
+
+def class_tolls(netdir, out):
+    links = _network_links(os.path.join(out, "SiouxFalls_tolled_net.txt"))
+    toll = [l[2] for l in links]
+    assert sum(float(x) != 0 for x in toll) == len(TOLLED_SF)
+    exempt = [("0" if CT_EXEMPT_NODE in (t, h) and float(x) != 0 else x)
+              for t, h, x in links]
+    assert sum(a != b for a, b in zip(toll, exempt)) == 8
+    w = lambda name, *a, **k: _write_class_toll(
+        os.path.join(out, "SiouxFalls_ct_%s.txt" % name), *a, **k)
+    w("exempt", links, [toll, exempt])
+    w("same2", links, [toll, toll])
+    w("zero2", links, [toll, ["0"] * len(links)])
+    stock = _network_links(os.path.join(netdir, "SiouxFalls_net.txt"))
+    w("same1", stock, [[l[2] for l in stock]])
+    # Negative fixtures, each one defect away from ct_same2.
+    w("bad_count", links, [toll, toll], nlinks=len(links) - 1)
+    w("bad_classes", links, [toll, toll], nclasses=3)
+    rows = w("bad_short", links, [toll, toll])
+    with open(os.path.join(out, "SiouxFalls_ct_bad_short.txt"), "w") as g:
+        g.write("\n".join(rows[:-1]) + "\n")
+    with open(os.path.join(out, "SiouxFalls_ct_bad_extra.txt"), "w") as g:
+        g.write("\n".join(rows + [rows[-1]]) + "\n")
+    hdr = 4  # metadata + comment lines before the first data row
+    sw = list(rows)
+    t, h, *rest = sw[hdr + 21].split()
+    assert (t, h) == ("8", "16")
+    sw[hdr + 21] = " ".join([h, t] + rest)
+    with open(os.path.join(out, "SiouxFalls_ct_bad_swapped.txt"), "w") as g:
+        g.write("\n".join(sw) + "\n")
+    co = list(rows)
+    co[hdr + 29] = co[hdr + 29].replace(" ;", " 5 ;")
+    with open(os.path.join(out, "SiouxFalls_ct_bad_cols.txt"), "w") as g:
+        g.write("\n".join(co) + "\n")
+    na = list(rows)
+    na[hdr + 29] = na[hdr + 29].replace(" ;", "").rsplit(" ", 1)[0] + " nan ;"
+    with open(os.path.join(out, "SiouxFalls_ct_bad_nan.txt"), "w") as g:
+        g.write("\n".join(na) + "\n")
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
@@ -126,6 +205,7 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     tolled_siouxfalls(a.net, a.out)
+    class_tolls(a.net, a.out)
     for net in PRELOAD_NETS:
         preload(a.net, a.out, net)
     if not a.no_chicago:

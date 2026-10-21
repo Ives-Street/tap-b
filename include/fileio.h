@@ -45,6 +45,8 @@ void readOBANetwork(network_type *network, char *linkFileName,
                     double defaultDemandMultiplier);
 /* IVES FORK: per-link fixed background flow, <PRELOAD FILE> */
 void readPreloadFile(network_type *network, char *preloadFileName);
+/* IVES FORK: per-class, per-link tolls, <CLASS TOLL FILE> */
+void readClassTollFile(network_type *network, char *classTollFileName);
 void setBatches(network_type *network, int batchSize, bool warmStart,
                 bool storeMatrices, char *matrixStem);
 void writeOBANetwork(network_type *Network, char *linkfile, char *tripfile);
