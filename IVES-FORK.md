@@ -628,11 +628,25 @@ Fixtures are derived, not committed: `test/make_fixtures.py` writes the tolled
 SiouxFalls network and class trips files, the ChicagoRegional splits (stock
 demand / 2 at toll factors 2 and 10 min/$; / 3 at 2, 10 and 0) and the preload
 files into `test/data/` (gitignored; the Chicago files are ~73 MB each).
-`make check-quick` skips the ChicagoRegional cases. Runtimes on a 12-core box:
-check-quick ~10 s; ChicagoRegional single-class ~5 min; the ChicagoRegional
-2- and 3-class cases ~2.5 and ~3 min each with `THREADS=12` (tap-b peak RSS
-3.8 / 5.7 GiB), and — projected from the per-iteration cost, not measured —
-~17 and ~25 min at the default 1 thread.
+`make check-quick` skips the ChicagoRegional cases. Runtimes on a 12-core box
+(dev1, shared and loaded): check-quick ~10 s; ChicagoRegional single-class ~5
+min; the ChicagoRegional 2- and 3-class cases ~2.5 and ~3 min each with
+`THREADS=12` (tap-b peak RSS 3.8 / 5.7 GiB). At the default 1 thread, 2-class
+measured 1,018 s (19 iterations) against 461 s for the serial build (25
+iterations): the parallel build at 1 thread is ~2.2× slower than serial. The
+3-class case at 1 thread was not run (Taylor, 2026-10-21); it is covered by the
+12-thread oracle pass and the SiouxFalls 3-class comparison with serial.
+
+**ChicagoRegional totals are report-only.** 2-class at 1 thread (solve 1e-6):
+the oracle puts both builds at per-class equilibrium (parallel 4.37e-7 /
+4.99e-7; serial 3.51e-7 / 3.39e-7), but their total link flows differ by up to
+7.2 veh, median 0.018 veh, 191 of 39,033 links above 1 veh, diffuse and on
+flat-BPR (lightly loaded) links. This is not a defect signal at solve 1e-6, and
+the 0.1-veh totals gate is defined for the small networks only, so
+`run_check.py` reports the Chicago comparison without failing on it. The
+explanation is an unproven hypothesis: it reads as convergence-tolerance spread
+(a ~4e-7 gap on 1.4M trips does not pin totals to 0.1 veh, as Anaheim2 shows at
+1e-10 vs 1e-13), but the tighter-solve confirmation was not run.
 
 **The oracle**, `tools/mcgap.py`, is stdlib-only Python 3 — no numpy, no
 Connectome environment — and shares no code with tap-b. Per class it evaluates

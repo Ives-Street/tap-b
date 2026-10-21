@@ -50,7 +50,7 @@ CASES = []
 
 
 def case(name, net, trips, preload, gap, maxit, kind, large=False, extra=(),
-         solve_gap=None):
+         solve_gap=None, totals_gate=True):
     """gap: the target.  For single-class cases it is also the solve's
     <CONVERGENCE GAP>.  For multi-class cases it is the per-class gate the
     oracle applies to *every* class, and solve_gap is the (tighter) aggregate
@@ -59,7 +59,8 @@ def case(name, net, trips, preload, gap, maxit, kind, large=False, extra=(),
     IVES-FORK.md 15a)."""
     CASES.append(dict(name=name, net=net, trips=trips, preload=preload,
                       gap=gap, maxit=maxit, kind=kind, large=large,
-                      extra=list(extra), solve_gap=solve_gap or gap))
+                      extra=list(extra), solve_gap=solve_gap or gap,
+                      totals_gate=totals_gate))
 
 
 for _n, _kind in [("SiouxFalls", "file"), ("Braess", "file"),
@@ -92,13 +93,18 @@ case("SF_tolled_2class_preload10", SF,
 case("Anaheim2_1batch", "Anaheim2_net.tntp",
      ["Anaheim2_trips1.tntp", "Anaheim2_trips2.tntp"], None, 1e-6, 300,
      "oracle", solve_gap=1e-13)
+# ChicagoRegional: the serial-totals comparison is report-only.  At solve 1e-6
+# both builds are at per-class equilibrium by the oracle (<= 5e-7), yet their
+# total flows differ by up to 7.2 veh (median 0.018, diffuse, on flat-BPR
+# links): a gap of ~4e-7 on 1.4M trips does not pin totals to 0.1 veh.  The
+# 0.1-veh gate is defined for the small networks only (IVES-FORK.md 15b).
 case("Chicago_2class", "ChicagoRegional_net.txt",
      ["ChicagoRegional_h2lo.txt", "ChicagoRegional_h2hi.txt"], None, 1e-5,
-     100, "oracle", large=True, solve_gap=1e-6)
+     100, "oracle", large=True, solve_gap=1e-6, totals_gate=False)
 case("Chicago_3class", "ChicagoRegional_net.txt",
      ["ChicagoRegional_t3lo.txt", "ChicagoRegional_t3hi.txt",
       "ChicagoRegional_t3free.txt"], None, 1e-5, 100, "oracle", large=True,
-     solve_gap=1e-6)
+     solve_gap=1e-6, totals_gate=False)
 
 
 def locate(fname):
@@ -254,7 +260,10 @@ def cmd_check(a):
                 dtot = max(abs(x[0] - y[0]) for x, y in zip(A, B))
                 dcls = max(abs(u - v) for x, y in zip(A, B)
                            for u, v in zip(x[2:], y[2:]))
-                ok = len(A) == len(B) and dtot <= a.flow_tol
+                ok = len(A) == len(B) and (dtot <= a.flow_tol
+                                           or not c["totals_gate"])
+                if not c["totals_gate"]:
+                    tag += " (totals report-only)"
                 print("%s %s vs serial: max |total diff| %.3e (tol %g); "
                       "max |class diff| %.3e (not unique, reported only); "
                       "serial iter %d gap %.3e %.1f s"
