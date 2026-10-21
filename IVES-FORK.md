@@ -11,7 +11,9 @@ switchable, one genuine feature — a per-link fixed background flow that
 upstream has no way to express — and two correctness fixes: the default
 bush-update scan is `LONGEST_BUSH_PATH`, because the upstream default can build
 a cyclic bush and crash (section 10); and multi-class runs no longer switch one
-class's tolls in under another class's queued work (section 14).
+class's tolls in under another class's queued work (section 14). Section 16 is
+a memory fix: the parallel build's scratch is per worker thread, not per
+origin.
 
 **Base commit:** `040135a20c771fbb84766df6a97cff981fa5df4b` (upstream `master`,
 2024-09-22). **Our branch:** `ives/main`. Upstream stays as the `upstream`
@@ -529,8 +531,8 @@ structurally — the class-cost-refactor merge (`5eda205`, 2025-02-27) passes th
 class's cost into the bush routines as an argument, so there is no shared
 `fixedCost` to swap and no `changeFixedCosts` in `bush.c` at all. A rebase onto
 `develop` would therefore **drop** this section's T1 and section 15's T2 rather
-than port them, while sections 2, 5, 6 and 10–13 (and the per-thread scratch
-planned next) would have to be ported onto the refactored code. There is no
+than port them, while sections 2, 5, 6 and 10–13 (and section 16's per-worker
+scratch) would have to be ported onto the refactored code. There is no
 rebase in this project; the pin is still the point. Reporting the race on
 `master` upstream is an outward-facing call, not made here.
 
@@ -631,7 +633,8 @@ files into `test/data/` (gitignored; the Chicago files are ~73 MB each).
 `make check-quick` skips the ChicagoRegional cases. Runtimes on a 12-core box
 (dev1, shared and loaded): check-quick ~10 s; ChicagoRegional single-class ~5
 min; the ChicagoRegional 2- and 3-class cases ~2.5 and ~3 min each with
-`THREADS=12` (tap-b peak RSS 3.8 / 5.7 GiB). At the default 1 thread, 2-class
+`THREADS=12` (tap-b peak RSS 3.8 / 5.7 GiB before section 16, 1.7 / 2.5 GiB
+after). At the default 1 thread, 2-class
 measured 1,018 s (19 iterations) against 461 s for the serial build (25
 iterations): the parallel build at 1 thread is ~2.2× slower than serial. The
 3-class case at 1 thread was not run (Taylor, 2026-10-21); it is covered by the
@@ -673,6 +676,117 @@ where tap-b's own gap is the preloaded problem's (section 6): oracle vs tap-b
 7.7010117393e-5 (ChicagoSketch), 1.5366444004e-5 vs 1.5366446902e-5 (Anaheim).
 Without `--preload` the oracle reads 2.5e-3, 1.9e-3 and 6.4e-4 on the same
 flows — the extension is doing the work.
+
+### 16. `src/bush.c`, `src/parallel_bush.c`, `src/thpool.c` — per-worker scratch rows
+
+The parallel build kept four scratch matrices — `LPcost_par`, `SPcost_par`,
+`nodeFlow_par` (`[·][node]`) and `flow_par` (`[·][arc]`) — with one row per
+**origin**, i.e. per (zone, class): 24 B/node + 8 B/arc per origin. At
+Washington DC (~85k nodes, ~195k arcs) that is ~3.6 MB per origin, ~6.5 GB
+per class at 1,814 zones — more than the bushes themselves. Nothing needs it:
+every pool task writes its row in full before it reads it, so a row need only
+live as long as the task. The rows are now one per **pool thread**.
+
+- `thpool` gives each worker a thread-local index, `thpool_worker_id` (0 ..
+  threads−1; −1 on any other thread), set once when the worker starts, and
+  `thpool_num_threads()`. No task signature changed: the `_par` functions read
+  `t = thpool_worker_id` and index `[t]` where they indexed `[origin]`.
+  `createBushes` allocates `thpool_num_threads(thpool)` rows
+  (`bushes->numScratchRows`); each pool entry (`initBushPool`,
+  `updateBushPool`, `updateFlowsPool`, `bushSPTTPool`) checks it is on a
+  worker whose row exists.
+- The places that read a row across tasks, or were indexed wrongly, were
+  changed rather than moved:
+  - **bins mode** (`<CALCULATE BINS>`, off by default, §3): the serial SPTT
+    loop `memcpy`'d `flow_par[r]` — whatever the last pooled task for origin
+    `r` left. It now recomputes the origin's flows serially
+    (`calculateBushFlows` into `bushes->flow`). The bins feed only DEBUG
+    output; flows are byte-identical with bins on (SiouxFalls 1-class and
+    tolled 2-class, 1 thread, vs 3808cb3).
+  - **`printBush`** (DEBUG dump at the end of `AlgorithmB`) read the
+    `[origin]` rows. It now takes the flow, node-flow and label vectors to
+    print; the call site recomputes flows serially first (only at DEBUG
+    verbosity — it is O(origins × arcs)) and, in the parallel build, passes no
+    labels (printed `nan`: no labels are current after the loop). One
+    implementation for both builds. Exercised with a DEBUG-verbosity build on
+    Braess.
+  - `pushBackFlowMerge_par`, `rectifyMerge_par`, `checkFlows_par` already
+    indexed `[t_id]`, but callers passed the origin; they now pass the worker
+    index (`rectifyMerge_par` has no caller; the `checkFlows_par` call is
+    commented out upstream).
+  - `nodeFlowshift_par`, declared and never allocated or used, is deleted.
+- The cycle diagnostics (§11) read the worker's row on a pool thread, and the
+  serial scratch vectors on the main thread — the serial-init fallback, where
+  3808cb3 read an `[origin]` row that path never writes. The
+  `<SELFTEST INJECT CYCLE>` dump is byte-identical to 3808cb3's.
+
+The bush file (`<STORE BUSHES>` / `<WARM START>`) is unchanged: it never held
+scratch.
+
+**Site table — also the port map** for any rebase onto upstream `develop`
+(§14): every `_par` scratch access at 3808cb3, by function. WBR = written
+before read within the same pool task (moved to `[t]` as is); XT = read
+across tasks (changed as above).
+
+| function (file) | arrays | class | why |
+|---|---|---|---|
+| `scanBushes_par` (parallel_bush.c) | LP, SP | WBR | initialises every node first |
+| `updateBushB_par` | flow, LP, SP | WBR | after `calculateBushFlows_par` + `scanBushes_par` in the same call |
+| `reconstructMerges_par` | flow | WBR | called by `updateBushB_par`; reads its NEW_LINK marks |
+| `rescanAndCheck_par` | SP, LP, flow | WBR | labels from its own `scanBushes_par`; flow from `updateFlowsB_par`'s `calculateBushFlows_par` |
+| `updateFlowPass_par` | nodeFlow, LP, SP | WBR | initialises nodeFlow; labels from `rescanAndCheck_par` |
+| `calculateBushFlows_par` | nodeFlow, flow | WBR | initialises every node and arc |
+| `pushBackFlowSimple_par` | flow, nodeFlow | WBR | inside the two above, after their init |
+| `pushBackFlowMerge_par` | flow, nodeFlow | WBR | `[t_id]`; callers now pass the worker index |
+| `newtonFlowShift_par` | flow | WBR | inside `updateFlowPass_par` |
+| `initialBushShortestPath_par` | SP | WBR | `arcIndexBellmanFord` initialises the labels |
+| `rectifyMerge_par`, `checkFlows_par` | nodeFlow, flow | dead | no live caller; `[t_id]` = worker index |
+| `diagInjectTwoCycle`, `diagSPcost/LPcost/Flow` (bush.c) | flow, SP, LP | WBR | inside `updateBushB_par` / `initBushPool` tasks; main thread reads serial scratch |
+| `bushSPTTPool` (bush.c) | SP | WBR | its own `scanBushes_par` writes the row |
+| `bushSPTT` serial loop, bins mode (bush.c) | flow | **XT** | recomputes serially |
+| `printBush` (bush.c) | all four | **XT** | takes the scratch explicitly |
+| `createBushes` / `deleteBushes`, `bushes_type` | all | alloc | `batchSize` rows → `numScratchRows` |
+
+74 indexed sites (56 in parallel_bush.c, 18 in bush.c); no `_par` scratch
+access anywhere else in `src/`, `include/` or `test/`.
+
+**Memory, measured** (ChicagoRegional: 12,982 nodes, 39,033 arcs with the 15
+artificial ones, 1,790 zones; `/usr/bin/time -v` on the tap-b process alone;
+12 threads; 3808cb3 and this section run back to back on the same inputs).
+Predicted drop: (24 × 12,982 + 8 × 39,033) B = 623,832 B per origin, × 1,790
+origins per class, less the 12 rows kept:
+
+| classes | 3808cb3 peak RSS | this section | drop | predicted drop |
+|---|---|---|---|---|
+| 1 | 1,981,992 kB | 898,420 kB | 1,083,572 kB | 1,083,177 kB |
+| 2 | 3,987,168 kB | 1,812,980 kB | 2,174,188 kB | 2,173,665 kB |
+| 3 | 5,929,076 kB | 2,664,588 kB | 3,264,488 kB | 3,264,153 kB |
+
+The model holds to 0.05 %. What remains grows ~0.88 GB per class here — the
+bushes (pred, bushOrder, merges) and the class's demand — so per-class memory
+is now about the bush file plus demand, not that plus 24 B/node + 8 B/arc ×
+origins.
+
+**Results unchanged.** Every task does the same arithmetic on a different
+row, so at `<NUMBER OF THREADS> 1` — where the parallel build is deterministic
+— flows are byte-identical: `make check-quick` against the committed goldens
+(the five single-class networks with and without preload), ChicagoRegional
+single-class md5 `57473a5a…` = golden, and the four small multi-class cases
+byte-identical to 3808cb3 (also with `<NUMBER OF BATCHES> 2`, where
+`readBushes` reallocates the rows every batch). Warm start: a bush file written
+by the shared binary (md5 `a68c72f0…`) loads, and the warm solve's flows are
+byte-identical to the shared binary's own warm solve (SiouxFalls,
+ChicagoSketch, 1 thread); the bush files the two binaries write are
+byte-identical too. At 12 threads the per-class oracle gaps on
+ChicagoRegional are 4.80e-7 / 7.85e-7 (2 classes) and 7.36e-7 / 9.61e-7 /
+8.60e-7 (3 classes), all under the 1e-5 gate.
+
+**Wall time.** Same box, back to back, 12 threads, dev1 shared (load average
+5–17 on 12 cores during the runs, so wall is ±30 %): 1 class 58 s vs 70 s
+(3808cb3); 2 classes 231 s vs 214 s; 3 classes 219 s vs 179 s. User CPU,
+less sensitive to other tenants, is flat or lower: 333 vs 324 s, 1,108 vs
+1,130 s, 1,358 vs 1,370 s; iterations equal (11/10, 18/18, 17/17). No
+regression is attributable beyond the noise.
 
 ## Not upstreamed (yet)
 
