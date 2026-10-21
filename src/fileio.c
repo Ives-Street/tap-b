@@ -503,12 +503,15 @@ void readOBANetwork(network_type *network, char *linkFileName,
         /* classFlow and classCost are initialized in finalizeNetwork */
     }
 
+    /* IVES FORK: reset once, outside the class loop.  Upstream reset it per
+     * class, so it held only the last class's demand and the AEC/MEC gap
+     * denominators were wrong for multi-class runs (IVES-FORK.md section 14). */
+    network->totalODFlow = 0;
     for (c = 0; c < network->numClasses; c++) {
         totalDemandCheck = 0; statedDemand = 0;
         tripFile = openFile(tripFileName[c], "r");
         /* Verify trip table metadata */
         endofMetadata = FALSE;
-        network->totalODFlow = 0;
         network->tollFactor[c] = defaultTollFactor;
         network->distanceFactor[c] = defaultDistanceFactor;
         do {

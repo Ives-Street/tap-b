@@ -740,6 +740,11 @@ void updateBatchBushes(network_type *network, bushes_type *bushes,
         bushes->updateBush[j] = TRUE;
         c = origin2class(network, j);
         if (c != *lastClass) {
+            /* IVES FORK: drain the pool before switching class costs.  The
+             * pool is asynchronous to this dispatcher, so without the wait the
+             * previous class's queued origins run against the next class's
+             * tolls -- at any thread count, 1 included (IVES-FORK.md 14). */
+            thpool_wait(thpool);
             changeFixedCosts(network, c);
         }
         thpool_add_work(thpool, (void (*)(void *)) updateBushPool,
@@ -753,6 +758,7 @@ void updateBatchBushes(network_type *network, bushes_type *bushes,
         bushes->updateBush[j] = TRUE;
         c = origin2class(network, j);
         if (c != *lastClass) {
+            thpool_wait(thpool); /* IVES FORK: drain first, as above */
             changeFixedCosts(network, c);
         }
         thpool_add_work(thpool, (void (*)(void *)) updateFlowsPool, 
@@ -797,10 +803,15 @@ void updateBatchFlows(network_type *network, bushes_type *bushes,
             if (bushes->updateBush[j] == FALSE) continue;
             c = origin2class(network, j);
             if (c != *lastClass) {
+                thpool_wait(thpool); /* IVES FORK: drain first */
                 changeFixedCosts(network, c);
             }
             thpool_add_work(thpool, (void (*)(void *)) updateFlowsPool,
                             (void*)&args[j]);
+            /* IVES FORK: upstream never advanced lastClass in this branch, so
+             * every origin whose class differed from the entry class re-ran
+             * the O(arcs) changeFixedCosts (IVES-FORK.md 14). */
+            *lastClass = c;
         }
         thpool_wait(thpool);
 
@@ -1053,8 +1064,11 @@ static void readSPTQueueDiscipline(void) {
  * took 14-52 s.  Each origin's work is independent (scanBushes_par +
  * BellmanFord_NoLabel write only that origin's SPcost_par row; the queue is
  * function-local), so dispatch it through the existing pool exactly like
- * updateBatchBushes does.  Single-class, bins-off fast path only; anything
- * else falls through to the stock serial loop. */
+ * updateBatchBushes does.  Bins-off fast path only; anything else falls
+ * through to the stock serial loop.  Multi-class runs take it too: origins are
+ * class-ordered, and the dispatcher drains the pool before each
+ * changeFixedCosts, so every origin is scanned under its own class's costs
+ * (IVES-FORK.md 15). */
 typedef struct {
     int origin;
     network_type *network;
@@ -1111,13 +1125,20 @@ double bushSPTT(network_type *network, bushes_type *bushes,
     int b, r, ij, i, j, c, lastClass = IS_MISSING, originNode;
     double frac, rc, acceptanceGap = 0, rejectionGap = INFINITY, consistency;
 #ifdef PARALLELISM
-    if (parameters->calculateBins == FALSE && network->numClasses == 1) {
+    if (parameters->calculateBins == FALSE) { /* IVES FORK: any class count */
         double psptt = 0;
+        int spClass = IS_MISSING;
         spttArgs_type *args = newVector(network->batchSize, spttArgs_type);
         int nQueued = 0;
         readSPTQueueDiscipline(); /* serial, before any worker reads sptQueue */
         for (r = 0; r < network->batchSize; r++) {
             if (outOfOrigins(network, r) == TRUE) break;
+            c = origin2class(network, r);
+            if (c != spClass) { /* IVES FORK: drain, then switch class costs */
+                thpool_wait(thpool);
+                changeFixedCosts(network, c);
+                spClass = c;
+            }
             args[r].origin = r;
             args[r].network = network;
             args[r].bushes = bushes;
@@ -1454,10 +1475,12 @@ void initializeBushesB(network_type *network, bushes_type *bushes,
      *
      * The fast path is taken only where it is provably the same computation:
      *
-     *  - numClasses == 1, so the changeFixedCosts sequencing the serial loop
-     *    performs collapses to the single hoisted call below.  (With one class
-     *    the serial loop calls it exactly once too, at origin 0, because
-     *    lastClass starts at IS_MISSING.)
+     *  - the changeFixedCosts sequencing the serial loop performs is kept:
+     *    origins are class-ordered, and the dispatcher drains the pool before
+     *    each class switch, so every tree is built under its own class's
+     *    costs.  With one class this is the single call at origin 0 the
+     *    serial loop makes too, because lastClass starts at IS_MISSING.
+     *    (IVES-FORK.md 15; this path was single-class only before.)
      *  - the two function pointers are the stock implementations, which are the
      *    ones audited for per-origin independence.  A future createInitialBush
      *    or topologicalOrder gets the serial loop until someone checks it.
@@ -1466,15 +1489,19 @@ void initializeBushesB(network_type *network, bushes_type *bushes,
      * see this block.
      */
     if (parameters->serialBushInit == FALSE
-            && network->numClasses == 1
             && parameters->createInitialBush == &initialBushShortestPath
             && parameters->topologicalOrder == &genericTopologicalOrder) {
         struct thread_args *args =
             newVector(network->batchSize, struct thread_args);
         int nQueued = 0;
-        changeFixedCosts(network, 0);
         for (origin = 0; origin < network->batchSize; origin++) {
             if (outOfOrigins(network, origin) == TRUE) break;
+            c = origin2class(network, origin);
+            if (c != lastClass) { /* IVES FORK: drain, then switch */
+                thpool_wait(thpool);
+                changeFixedCosts(network, c);
+                lastClass = c;
+            }
             args[origin].id = origin;
             args[origin].network = network;
             args[origin].bushes = bushes;
