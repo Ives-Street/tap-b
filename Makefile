@@ -89,6 +89,27 @@ $(BINDIR)/bpr_preload_test: test/bpr_preload_test.c $(OBJDIR)/tap.o \
 	$(CC) -std=gnu17 -pthread -Wall $(INCLUDEFLAG) -DPARALLELISM=1 -O2 \
 	    $^ -lm -o $@
 
+# ---------- check target (IVES FORK) ---------------
+# The L1 regression ladder (IVES-FORK.md 14-15): single-class flows at 1
+# thread byte-compared with committed goldens (test/golden/), multi-class
+# cases checked per class by the independent oracle tools/mcgap.py.  Fixtures
+# are derived from net/ by test/make_fixtures.py into test/data/ (gitignored).
+# Needs python3 (stdlib only).  THREADS sets the multi-class cases' thread
+# count; check-quick skips the ChicagoRegional cases (minutes each).
+THREADS ?= 1
+CHECKFLAGS ?=
+
+.PHONY: check check-quick
+check: $(BINDIR)/$(PROJECT)
+	python3 test/make_fixtures.py
+	python3 test/run_check.py check --bin $(BINDIR)/$(PROJECT) \
+	    --threads $(THREADS) $(CHECKFLAGS)
+
+check-quick: $(BINDIR)/$(PROJECT)
+	python3 test/make_fixtures.py --no-chicago
+	python3 test/run_check.py check --bin $(BINDIR)/$(PROJECT) \
+	    --threads $(THREADS) --skip-large $(CHECKFLAGS)
+
 # ---------- compile objects
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c $(DEPDIR)/%.d

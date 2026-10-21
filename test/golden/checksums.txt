@@ -1,0 +1,4 @@
+# md5 of flows.txt at <NUMBER OF THREADS> 1 (run_check.py)
+7219fb4b89267efb69a7a7f58c1fa3cb Barcelona
+5cc6b1fe4852a0941f1fe7fc00fe9c3e Barcelona_preload10
+57473a5a85a0264bdcf641503ea36fb7 ChicagoRegional
