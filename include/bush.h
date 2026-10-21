@@ -125,11 +125,14 @@ typedef struct bushes_type {
    int      *numMerges; /* [origin] */
    merge_type ***merges; /* [origin][merge]*/
 #if PARALLELISM
-   double   **LPcost_par; /* [origin][node] */
-   double   **SPcost_par; /* [origin][node] */
-   double   **flow_par; /* [origin][node] */
-   double   **nodeFlow_par; /* [origin][node] */
-   double   **nodeFlowshift_par; /* [origin][shift] */
+   /* IVES FORK: per-worker scratch, one row per pool thread (IVES-FORK.md 16).
+    * Upstream sized these [origin]; every task writes its row before reading
+    * it, so a row need only live as long as the task. */
+   int      numScratchRows; /* = thpool_num_threads(thpool) */
+   double   **LPcost_par; /* [worker][node] */
+   double   **SPcost_par; /* [worker][node] */
+   double   **flow_par; /* [worker][arc] */
+   double   **nodeFlow_par; /* [worker][node] */
 #endif
    network_type *network; /* Points back to the corresponding network */
 } bushes_type;
@@ -435,7 +438,9 @@ void linearCostUpdate(int ij, double shift, network_type *network);
 void noCostUpdate(int ij, double shift, network_type *network);
 void checkFlows(network_type *network, bushes_type *bushes);
 void printBush(int minVerbosity, int origin, network_type *network,
-               bushes_type *bushes);
+               bushes_type *bushes, const double *flow,
+               const double *nodeFlow, const double *SPcost,
+               const double *LPcost);
 
 /**** Merges and merge-doubly linked lists ****/
 

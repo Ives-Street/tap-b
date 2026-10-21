@@ -107,8 +107,11 @@ void diagInjectTwoCycle(int origin, network_type *network,
             if (network->arcs[ji].tail != j) continue;
             if (isInBush(origin, ji, network, bushes) == TRUE) continue;
 #if PARALLELISM
-            if (bushes->flow_par[origin][ji] > 0) continue;
-            bushes->flow_par[origin][ji] = NEW_LINK;
+            /* IVES FORK: the calling worker's scratch row (IVES-FORK.md 16) */
+            double *flow = thpool_worker_id >= 0 ?
+                           bushes->flow_par[thpool_worker_id] : bushes->flow;
+            if (flow[ji] > 0) continue;
+            flow[ji] = NEW_LINK;
 #else
             if (bushes->flow[ji] > 0) continue;
             bushes->flow[ji] = NEW_LINK;
@@ -127,9 +130,15 @@ void diagInjectTwoCycle(int origin, network_type *network,
                    origin + 1);
 }
 
+/* IVES FORK: on a pool thread these read that worker's scratch row
+ * (IVES-FORK.md 16); on the main thread -- the serial-init fallback in a
+ * parallel build -- the serial scratch vectors, which are what that path
+ * writes.  (3808cb3 read a [origin] row the serial path never wrote.) */
 static double diagSPcost(int origin, int i, bushes_type *bushes) {
 #if PARALLELISM
-    return bushes->SPcost_par[origin][i];
+    (void) origin;
+    return thpool_worker_id >= 0 ? bushes->SPcost_par[thpool_worker_id][i]
+                                 : bushes->SPcost[i];
 #else
     (void) origin;
     return bushes->SPcost[i];
@@ -138,7 +147,9 @@ static double diagSPcost(int origin, int i, bushes_type *bushes) {
 
 static double diagLPcost(int origin, int i, bushes_type *bushes) {
 #if PARALLELISM
-    return bushes->LPcost_par[origin][i];
+    (void) origin;
+    return thpool_worker_id >= 0 ? bushes->LPcost_par[thpool_worker_id][i]
+                                 : bushes->LPcost[i];
 #else
     (void) origin;
     return bushes->LPcost[i];
@@ -147,7 +158,9 @@ static double diagLPcost(int origin, int i, bushes_type *bushes) {
 
 static double diagFlow(int origin, int ij, bushes_type *bushes) {
 #if PARALLELISM
-    return bushes->flow_par[origin][ij];
+    (void) origin;
+    return thpool_worker_id >= 0 ? bushes->flow_par[thpool_worker_id][ij]
+                                 : bushes->flow[ij];
 #else
     (void) origin;
     return bushes->flow[ij];
@@ -520,8 +533,22 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
         storeBatch(0, network, bushes, parameters);
     }
 
-    for (int i = 0; i < network->numZones; i++) {
-        printBush(DEBUG, i, network, bushes);
+    /* IVES FORK: printBush takes the scratch it prints (IVES-FORK.md 16).
+     * Here, after the loop, the flows are recomputed serially; the labels are
+     * passed only in the serial build, whose scratch they are (and there, as
+     * upstream, whatever the last scan left).  Guarded, since the recompute
+     * is O(origins x arcs). */
+    if (verbosity >= DEBUG) {
+        for (int i = 0; i < network->numZones; i++) {
+            calculateBushFlows(i, network, bushes);
+#if PARALLELISM
+            printBush(DEBUG, i, network, bushes, bushes->flow,
+                      bushes->nodeFlow, NULL, NULL);
+#else
+            printBush(DEBUG, i, network, bushes, bushes->flow,
+                      bushes->nodeFlow, bushes->SPcost, bushes->LPcost);
+#endif
+        }
     }
     if (strlen(parameters->pathFlowsFile) > 0) {
         writePathFlows(network, bushes, parameters);
@@ -1105,7 +1132,8 @@ static void readSPTQueueDiscipline(void) {
  * measured at ~35 min per gap evaluation while the iteration's actual work
  * took 14-52 s.  Each origin's work is independent (scanBushes_par +
  * BellmanFord_NoLabel write only that origin's SPcost_par row; the queue is
- * function-local), so dispatch it through the existing pool exactly like
+ * function-local; the row is now the worker's, IVES-FORK.md 16), so
+ * dispatch it through the existing pool exactly like
  * updateBatchBushes does.  Bins-off fast path only; anything else falls
  * through to the stock serial loop.  Multi-class runs take it too: origins are
  * class-ordered, and the dispatcher drains the pool before each
@@ -1126,6 +1154,8 @@ static void bushSPTTPool(void *pVoid) {
     int r = a->origin, j;
     network_type *network = a->network;
     bushes_type *bushes = a->bushes;
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
+    checkScratchRow(bushes);
     /* IVES FORK: <GAP TIMING>.  The two halves of a per-origin SPTT are
      * charged separately.  scanBushes_par is O(nodes + bush arcs) and should
      * be a fixed cost; BellmanFord_NoLabel is label-correcting and its cost
@@ -1139,8 +1169,8 @@ static void bushSPTTPool(void *pVoid) {
     if (timing) clock_gettime(CLOCK_MONOTONIC_RAW, &s0);
     scanBushes_par(r, network, bushes, a->parameters, NO_LONGEST_PATH);
     if (timing) clock_gettime(CLOCK_MONOTONIC_RAW, &s1);
-    BellmanFord_NoLabel(origin2node(network, r), bushes->SPcost_par[r],
-                        network, sptQueue, bushes->SPcost_par[r],
+    BellmanFord_NoLabel(origin2node(network, r), bushes->SPcost_par[t],
+                        network, sptQueue, bushes->SPcost_par[t],
                         bushes->bushOrder[r]);
     if (timing) {
         clock_gettime(CLOCK_MONOTONIC_RAW, &b1);
@@ -1151,7 +1181,7 @@ static void bushSPTTPool(void *pVoid) {
     }
     a->sptt = 0;
     for (j = 0; j < network->numZones; j++) {
-        a->sptt += network->demand[r][j] * bushes->SPcost_par[r][j];
+        a->sptt += network->demand[r][j] * bushes->SPcost_par[t][j];
     }
 }
 #endif
@@ -1251,9 +1281,11 @@ double bushSPTT(network_type *network, bushes_type *bushes,
         }
         if (parameters->calculateBins == TRUE) {
 #ifdef PARALLELISM
-            /* Ensures bushes->flows has the right values */
-            memcpy(bushes->flow, bushes->flow_par[r],
-                   network->numArcs * sizeof(bushes->flow_par[0][0]));
+            /* Ensures bushes->flows has the right values.  IVES FORK: was a
+             * memcpy of flow_par[r], the row the last pooled task for origin r
+             * left behind; the rows are now per worker (IVES-FORK.md 16), so
+             * recompute this origin's flows here, serially. */
+            calculateBushFlows(r, network, bushes);
 #endif
             for (ij = 0; ij < network->numArcs; ij++) {
                 i = network->arcs[ij].tail;
@@ -1471,10 +1503,18 @@ bushes_type *createBushes(network_type *network) {
     bushes->updateBush = newVector(network->batchSize, bool);
 
 #if PARALLELISM
-    bushes->LPcost_par = newMatrix(network->batchSize, network->numNodes,double);
-    bushes->SPcost_par = newMatrix(network->batchSize, network->numNodes,double);
-    bushes->flow_par = newMatrix(network->batchSize, network->numArcs,double);
-    bushes->nodeFlow_par = newMatrix(network->batchSize, network->numNodes,double);
+    /* IVES FORK: one scratch row per pool thread, not per origin
+     * (IVES-FORK.md 16).  At Washington DC scale the [origin] rows were
+     * ~3.6 MB per origin per class -- more than the bushes themselves. */
+    bushes->numScratchRows = thpool_num_threads(thpool);
+    bushes->LPcost_par = newMatrix(bushes->numScratchRows, network->numNodes,
+                                   double);
+    bushes->SPcost_par = newMatrix(bushes->numScratchRows, network->numNodes,
+                                   double);
+    bushes->flow_par = newMatrix(bushes->numScratchRows, network->numArcs,
+                                 double);
+    bushes->nodeFlow_par = newMatrix(bushes->numScratchRows, network->numNodes,
+                                     double);
 #endif
     for (i = 0; i < network->batchSize; i++) {
        bushes->numMerges[i] = 0;
@@ -1508,10 +1548,10 @@ void deleteBushes(network_type *network, bushes_type *bushes) {
     deleteVector(bushes->merges);
     deleteVector(bushes->updateBush);
 #if PARALLELISM
-    deleteMatrix(bushes->LPcost_par, network->batchSize);
-    deleteMatrix(bushes->SPcost_par, network->batchSize);
-    deleteMatrix(bushes->flow_par, network->batchSize);
-    deleteMatrix(bushes->nodeFlow_par, network->batchSize);
+    deleteMatrix(bushes->LPcost_par, bushes->numScratchRows);
+    deleteMatrix(bushes->SPcost_par, bushes->numScratchRows);
+    deleteMatrix(bushes->flow_par, bushes->numScratchRows);
+    deleteMatrix(bushes->nodeFlow_par, bushes->numScratchRows);
 #endif
     deleteScalar(bushes);
 }
@@ -1543,7 +1583,8 @@ void initializeBushesB(network_type *network, bushes_type *bushes,
      * origins, ~85k nodes, ~195k arcs) it was measured at 14.8 minutes -- paid
      * once per cold start, i.e. once per scenario entry and after every
      * topology-changing mutation.  Each origin's work is independent once the
-     * shared SPcost scratch is replaced by the per-origin SPcost_par row (see
+     * shared SPcost scratch is replaced by a SPcost_par row (per worker since
+     * IVES-FORK.md 16; see
      * initialBushShortestPath_par), so dispatch it through the existing pool in
      * the same shape updateBatchBushes uses.
      *
@@ -2304,29 +2345,42 @@ void checkFlows(network_type *network, bushes_type *bushes) {
     deleteVector(flowCheck);
 }
 
+/*
+ * printBush -- DEBUG dump of one bush.  IVES FORK: takes the scratch it prints
+ * explicitly (IVES-FORK.md 16).  The parallel build's version read the
+ * per-origin rows, which no longer exist; the serial build's recomputed flows
+ * itself.  Callers now pass flows they have just computed for this origin --
+ * from inside the origin's task, or after a serial calculateBushFlows -- and
+ * the labels if they have them (NULL prints nan).  One implementation for
+ * both builds.
+ */
+static double printBushValue(const double *v, int i) {
+    return v == NULL ? NAN : v[i];
+}
+
 void printBush(int minVerbosity, int origin, network_type *network,
-               bushes_type *bushes) {
-    /* TODO: A lot of duplicate code between serial/parallel, fix ... */
+               bushes_type *bushes, const double *flow,
+               const double *nodeFlow, const double *SPcost,
+               const double *LPcost) {
+    int a, i, ij, m, curnode;
+    merge_type *merge;
     if (verbosity < minVerbosity) return;
-#if PARALLELISM
-    int a, i, ij, m, curnode;
-    merge_type *merge;
     displayMessage(minVerbosity, "#%d: Printing bush information for bush %d\n",
                     origin + 1, origin + 1);
     displayMessage(minVerbosity, "#%d: %d %f %f %f [1]\n",
                    origin + 1,
                    origin + 1,
-                   bushes->nodeFlow_par[origin][origin],
-                   bushes->SPcost_par[origin][origin],
-                   bushes->LPcost_par[origin][origin]);
+                   printBushValue(nodeFlow, origin),
+                   printBushValue(SPcost, origin),
+                   printBushValue(LPcost, origin));
     for (curnode = 1; curnode < network->numNodes; curnode++) {
         i = bushes->bushOrder[origin][curnode];
         displayMessage(minVerbosity, "#%d: Node %d %f %f %f [%d]\n", 
                        origin + 1,
                        i + 1,
-                       bushes->nodeFlow_par[origin][i],
-                       bushes->SPcost_par[origin][i],
-                       bushes->LPcost_par[origin][i],
+                       printBushValue(nodeFlow, i),
+                       printBushValue(SPcost, i),
+                       printBushValue(LPcost, i),
                        curnode + 1);
         if (isMergeNode(origin, i, bushes) == TRUE) {
             m = pred2merge(bushes->pred[origin][i]);
@@ -2337,7 +2391,7 @@ void printBush(int minVerbosity, int origin, network_type *network,
                                origin + 1,
                                network->arcs[ij].tail + 1,
                                network->arcs[ij].head + 1,
-                               bushes->flow_par[origin][ij],
+                               printBushValue(flow, ij),
                                network->arcs[ij].cost,
                                a == merge->SPlink ? 'S' : ' ',
                                a == merge->LPlink ? 'L' : ' ');
@@ -2348,56 +2402,10 @@ void printBush(int minVerbosity, int origin, network_type *network,
                            origin + 1,
                            network->arcs[ij].tail + 1,
                            network->arcs[ij].head + 1,
-                           bushes->flow_par[origin][ij],
+                           printBushValue(flow, ij),
                            network->arcs[ij].cost);
         }
     }
-#else
-    int a, i, ij, m, curnode;
-    merge_type *merge;
-    calculateBushFlows(origin, network, bushes);
-    displayMessage(minVerbosity, "#%d: Printing bush information for bush %d\n",
-                    origin + 1, origin + 1);
-    displayMessage(minVerbosity, "#%d: %d %f %f %f [1]\n",
-                   origin + 1,
-                   origin + 1,
-                   bushes->nodeFlow[origin],
-                   bushes->SPcost[origin],
-                   bushes->LPcost[origin]);
-    for (curnode = 1; curnode < network->numNodes; curnode++) {
-        i = bushes->bushOrder[origin][curnode];
-        displayMessage(minVerbosity, "#%d: Node %d %f %f %f [%d]\n", 
-                       origin + 1,
-                       i + 1,
-                       bushes->nodeFlow[i],
-                       bushes->SPcost[i],
-                       bushes->LPcost[i],
-                       curnode + 1);
-        if (isMergeNode(origin, i, bushes) == TRUE) {
-            m = pred2merge(bushes->pred[origin][i]);
-            merge = bushes->merges[origin][m];
-            for (a = 0; a < merge->numApproaches; a++) {
-                ij = merge->approach[a];
-                displayMessage(minVerbosity, "#%d: (%d,%d) %f %f %c%c\n",
-                               origin + 1,
-                               network->arcs[ij].tail + 1,
-                               network->arcs[ij].head + 1,
-                               bushes->flow[ij],
-                               network->arcs[ij].cost,
-                               a == merge->SPlink ? 'S' : ' ',
-                               a == merge->LPlink ? 'L' : ' ');
-            }
-        } else {
-            ij = bushes->pred[origin][i];
-            displayMessage(minVerbosity, "#%d: (%d,%d) %f %f\n",
-                           origin + 1,
-                           network->arcs[ij].tail + 1,
-                           network->arcs[ij].head + 1,
-                           bushes->flow[ij],
-                           network->arcs[ij].cost);
-        }
-    }
-#endif
 }
 
 /*

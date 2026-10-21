@@ -12,20 +12,21 @@ pthread_mutex_t shift_lock;
 */
 void scanBushes_par(int origin, network_type *network, bushes_type *bushes,
                     algorithmBParameters_type *parameters, scan_type LPrule) {
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
     int h, i, hi, m, curnode, curarc;
     double tempcost;
     merge_type *merge;
 
     for (i = 0; i < network->numNodes; i++) {
-        bushes->LPcost_par[origin][i] = -INFINITY;
-        bushes->SPcost_par[origin][i] = INFINITY;
+        bushes->LPcost_par[t][i] = -INFINITY;
+        bushes->SPcost_par[t][i] = INFINITY;
     }
 
     /* Ensure costs are up to date */
     if (parameters->linkShiftB != &exactCostUpdate) updateAllCosts(network);
 
-    bushes->SPcost_par[origin][origin2node(network, origin)] = 0;
-    bushes->LPcost_par[origin][origin2node(network, origin)] = 0;
+    bushes->SPcost_par[t][origin2node(network, origin)] = 0;
+    bushes->LPcost_par[t][origin2node(network, origin)] = 0;
     for (curnode = 1; curnode < network->numNodes; curnode++) {
         i = bushes->bushOrder[origin][curnode];
         /* Iterate over incoming links */
@@ -35,9 +36,9 @@ void scanBushes_par(int origin, network_type *network, bushes_type *bushes,
             for (curarc = 0; curarc < merge->numApproaches; curarc++) {
                 hi = merge->approach[curarc];
                 h = network->arcs[hi].tail;
-                tempcost = bushes->SPcost_par[origin][h] + network->arcs[hi].cost;
-                if (tempcost < bushes->SPcost_par[origin][i]) {
-                    bushes->SPcost_par[origin][i] = tempcost;
+                tempcost = bushes->SPcost_par[t][h] + network->arcs[hi].cost;
+                if (tempcost < bushes->SPcost_par[t][i]) {
+                    bushes->SPcost_par[t][i] = tempcost;
                     merge->SPlink = curarc;
                 }
             }
@@ -46,8 +47,8 @@ void scanBushes_par(int origin, network_type *network, bushes_type *bushes,
             for (curarc = 0; curarc < merge->numApproaches; curarc++) {
                 hi = merge->approach[curarc];
                 h = network->arcs[hi].tail;
-                tempcost = bushes->LPcost_par[origin][h] + network->arcs[hi].cost;     
-                if (tempcost > bushes->LPcost_par[origin][i]
+                tempcost = bushes->LPcost_par[t][h] + network->arcs[hi].cost;     
+                if (tempcost > bushes->LPcost_par[t][i]
                   && (LPrule == LONGEST_BUSH_PATH
                     || (LPrule == LONGEST_USED_PATH
                       && merge->approachFlow[curarc] > parameters->minLinkFlow)
@@ -55,15 +56,15 @@ void scanBushes_par(int origin, network_type *network, bushes_type *bushes,
                       &&(merge->approachFlow[curarc] > parameters->minLinkFlow
                       || merge->SPlink == curarc)))) {
                     
-                    bushes->LPcost_par[origin][i] = tempcost;
+                    bushes->LPcost_par[t][i] = tempcost;
                     merge->LPlink = curarc;
                 }
             }
         } else { /* Only one incoming bush link, not much to do */
             hi = bushes->pred[origin][i];
             h = network->arcs[hi].tail;
-            bushes->LPcost_par[origin][i] = bushes->LPcost_par[origin][h] + network->arcs[hi].cost;
-            bushes->SPcost_par[origin][i] = bushes->SPcost_par[origin][h] + network->arcs[hi].cost;
+            bushes->LPcost_par[t][i] = bushes->LPcost_par[t][h] + network->arcs[hi].cost;
+            bushes->SPcost_par[t][i] = bushes->SPcost_par[t][h] + network->arcs[hi].cost;
         }
     }
 }
@@ -80,6 +81,7 @@ void scanBushes_par(int origin, network_type *network, bushes_type *bushes,
  */
 void updateBushB_par(int origin, network_type *network, bushes_type *bushes,
                  algorithmBParameters_type *parameters) {
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
 
     int ij, i, j, newArcs = 0;
 
@@ -94,31 +96,31 @@ void updateBushB_par(int origin, network_type *network, bushes_type *bushes,
     for (ij = 0; ij < network->numArcs; ij++) {
         /* Mark links with near-zero contribution for removal by setting to
          * exactly zero */
-        if (bushes->flow_par[origin][ij] < parameters->minLinkFlow) {
+        if (bushes->flow_par[t][ij] < parameters->minLinkFlow) {
             if (isInBush(origin, ij, network, bushes) == TRUE)
-            bushes->flow_par[origin][ij] = 0;
+            bushes->flow_par[t][ij] = 0;
         }
-        if (bushes->flow_par[origin][ij] > 0) continue; /* Link is already in the bush, no
+        if (bushes->flow_par[t][ij] > 0) continue; /* Link is already in the bush, no
                                                need to add it again */
         /* See if the link provides a shortcut using the strict criterion */
         i = network->arcs[ij].tail;
         j = network->arcs[ij].head;
-        if (bushes->LPcost_par[origin][i] == -INFINITY && bushes->LPcost_par[origin][j] > -INFINITY)
+        if (bushes->LPcost_par[t][i] == -INFINITY && bushes->LPcost_par[t][j] > -INFINITY)
             continue; /* No path to extend */
-        if (bushes->SPcost_par[origin][i] + network->arcs[ij].cost < bushes->SPcost_par[origin][j]
-            && bushes->LPcost_par[origin][i] < bushes->LPcost_par[origin][j]
+        if (bushes->SPcost_par[t][i] + network->arcs[ij].cost < bushes->SPcost_par[t][j]
+            && bushes->LPcost_par[t][i] < bushes->LPcost_par[t][j]
             && (network->arcs[ij].tail == origin2node(network, origin)
                 || network->arcs[ij].tail >= network->firstThroughNode))
         {
-            bushes->flow_par[origin][ij] = NEW_LINK;
+            bushes->flow_par[t][ij] = NEW_LINK;
             diagRecordNewArc(ij, 1); /* IVES F1 DIAGNOSTIC */
             newArcs++;
             /* Never delete shortest path tree... should be OK with floating point
              * comparison since this is how SPcost is calculated */
-        } else if (bushes->SPcost_par[origin][i]+network->arcs[ij].cost==bushes->SPcost_par[origin][j]
-                   && bushes->flow_par[origin][ij] == 0
+        } else if (bushes->SPcost_par[t][i]+network->arcs[ij].cost==bushes->SPcost_par[t][j]
+                   && bushes->flow_par[t][ij] == 0
                    && isInBush(origin, ij, network, bushes) == TRUE) {
-            bushes->flow_par[origin][ij] = NEW_LINK;
+            bushes->flow_par[t][ij] = NEW_LINK;
             diagRecordNewArc(ij, 2); /* IVES F1 DIAGNOSTIC */
         }
     }
@@ -131,13 +133,13 @@ void updateBushB_par(int origin, network_type *network, bushes_type *bushes,
         for (ij = 0; ij < network->numArcs; ij++) {
             i = network->arcs[ij].tail;
             j = network->arcs[ij].head;
-            if (bushes->LPcost_par[origin][i]==-INFINITY && bushes->LPcost_par[origin][j]>-INFINITY)
+            if (bushes->LPcost_par[t][i]==-INFINITY && bushes->LPcost_par[t][j]>-INFINITY)
                 continue; /* No path to extend */
-            if (bushes->flow_par[origin][ij] == 0 && bushes->LPcost_par[origin][i] < bushes->LPcost_par[origin][j]
+            if (bushes->flow_par[t][ij] == 0 && bushes->LPcost_par[t][i] < bushes->LPcost_par[t][j]
                 && (network->arcs[ij].tail == origin2node(network, origin)
                     || network->arcs[ij].tail >= network->firstThroughNode))
             {
-                bushes->flow_par[origin][ij] = NEW_LINK;
+                bushes->flow_par[t][ij] = NEW_LINK;
                 diagRecordNewArc(ij, 3); /* IVES F1 DIAGNOSTIC */
             }
         }
@@ -172,6 +174,7 @@ void updateBushB_par(int origin, network_type *network, bushes_type *bushes,
  * Then transfer into an array for fast indexing.
  */
 void reconstructMerges_par(int origin, network_type *network, bushes_type *bushes){
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
 //    displayMessage(FULL_NOTIFICATIONS, "Top of update reconstructmerg %d\n", t_id);
 
     int i, hi, lastApproach, m, arc, numApproaches;
@@ -188,7 +191,7 @@ void reconstructMerges_par(int origin, network_type *network, bushes_type *bushe
         for (curArc = network->nodes[i].reverseStar.head; curArc != NULL;
              curArc = curArc->next) {
             hi = ptr2arc(network, curArc->arc);
-            if (bushes->flow_par[origin][hi] > 0 || bushes->flow_par[origin][hi] == NEW_LINK) {
+            if (bushes->flow_par[t][hi] > 0 || bushes->flow_par[t][hi] == NEW_LINK) {
                 numApproaches++;
                 lastApproach = hi;
             }
@@ -198,17 +201,17 @@ void reconstructMerges_par(int origin, network_type *network, bushes_type *bushe
                        "incoming contributing links", i+1, origin+1);
         if (numApproaches == 1) { /* No merge */
             bushes->pred[origin][i] = lastApproach;
-            if (bushes->flow_par[origin][lastApproach] == NEW_LINK) bushes->flow_par[origin][lastApproach] = 0;
+            if (bushes->flow_par[t][lastApproach] == NEW_LINK) bushes->flow_par[t][lastApproach] = 0;
         } else { /* Must create a merge */
             merge = createMerge(numApproaches);
             arc = 0;
             for (curArc = network->nodes[i].reverseStar.head; curArc != NULL;
                  curArc = curArc->next) {
                 hi = ptr2arc(network, curArc->arc);
-                if (bushes->flow_par[origin][hi] > 0 || bushes->flow_par[origin][hi] == NEW_LINK) {
-                    if (bushes->flow_par[origin][hi] == NEW_LINK) bushes->flow_par[origin][hi] = 0;
+                if (bushes->flow_par[t][hi] > 0 || bushes->flow_par[t][hi] == NEW_LINK) {
+                    if (bushes->flow_par[t][hi] == NEW_LINK) bushes->flow_par[t][hi] = 0;
                     merge->approach[arc] = hi;
-                    merge->approachFlow[arc] = bushes->flow_par[origin][hi];
+                    merge->approachFlow[arc] = bushes->flow_par[t][hi];
                     arc++;
                 }
             }
@@ -271,7 +274,7 @@ bool updateFlowsB_par(int origin, network_type *network, bushes_type *bushes,
         pthread_mutex_unlock(&shift_lock);
 
         /* Uncomment next line for extra validation checking */
-//        checkFlows_par(network, bushes, t_id);
+//        checkFlows_par(network, bushes, thpool_worker_id);
         if (parameters->rescanAfterShift == TRUE
             && i + 1 < parameters->shiftReps) {
             if (rescanAndCheck_par(origin, network, bushes, parameters) == FALSE)
@@ -291,6 +294,7 @@ bool updateFlowsB_par(int origin, network_type *network, bushes_type *bushes,
  */
 bool rescanAndCheck_par(int origin, network_type *network, bushes_type *bushes,
                     algorithmBParameters_type *parameters) {
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
     int i, j, ij;
     double maxgap = 0;
     double bushSPTT = 0, bushExcess = 0;
@@ -298,17 +302,17 @@ bool rescanAndCheck_par(int origin, network_type *network, bushes_type *bushes,
     scanBushes_par(origin, network, bushes, parameters, LONGEST_USED_PATH);
     findDivergenceNodes(origin, network, bushes);
     for (i = 0; i < network->numZones; i++) {
-        bushSPTT += network->demand[origin][i] * bushes->SPcost_par[origin][i];
-        maxgap = max(maxgap, fabs(bushes->LPcost_par[origin][i] -bushes->SPcost_par[origin][i]));
+        bushSPTT += network->demand[origin][i] * bushes->SPcost_par[t][i];
+        maxgap = max(maxgap, fabs(bushes->LPcost_par[t][i] -bushes->SPcost_par[t][i]));
     }
     for (; i < network->numNodes; i++) {
-        maxgap = max(maxgap, fabs(bushes->LPcost_par[origin][i] -bushes->SPcost_par[origin][i]));
+        maxgap = max(maxgap, fabs(bushes->LPcost_par[t][i] -bushes->SPcost_par[t][i]));
     }
     for (ij = 0; ij < network->numArcs; ij++) {
         i = network->arcs[ij].tail;
         j = network->arcs[ij].head;
-        bushExcess += bushes->flow_par[origin][ij] * (network->arcs[ij].cost +
-                                          bushes->SPcost_par[origin][i] - bushes->SPcost_par[origin][j]);
+        bushExcess += bushes->flow_par[t][ij] * (network->arcs[ij].cost +
+                                          bushes->SPcost_par[t][i] - bushes->SPcost_par[t][j]);
     }
     //displayMessage(DEBUG, "Scanning %d, gap is %f\n", origin,
     //               bushExcess / bushSPTT);
@@ -326,15 +330,16 @@ bool rescanAndCheck_par(int origin, network_type *network, bushes_type *bushes,
  */
 void updateFlowPass_par(int origin, network_type *network, bushes_type *bushes,
                     algorithmBParameters_type *parameters) {
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
     int i, j, m, node;
     merge_type *merge;
 
 
     /* Initialize node flows with OD matrix */
     for (i = 0; i < network->numZones; i++)
-        bushes->nodeFlow_par[origin][i] = network->demand[origin][i];
+        bushes->nodeFlow_par[t][i] = network->demand[origin][i];
 
-    for (; i < network->numNodes; i++) bushes->nodeFlow_par[origin][i] = 0;
+    for (; i < network->numNodes; i++) bushes->nodeFlow_par[t][i] = 0;
 
 
     /* Descending pass for flow shifts */
@@ -346,12 +351,12 @@ void updateFlowPass_par(int origin, network_type *network, bushes_type *bushes,
             m = pred2merge(bushes->pred[origin][j]);
             merge = bushes->merges[origin][m];
             if (merge->LPlink == merge->SPlink
-                || (fabs(bushes->LPcost_par[origin][j] - bushes->SPcost_par[origin][j])
+                || (fabs(bushes->LPcost_par[t][j] - bushes->SPcost_par[t][j])
                         < parameters->minCostDifference)
-                || bushes->nodeFlow_par[origin][j] < parameters->minLinkFlowShift
+                || bushes->nodeFlow_par[t][j] < parameters->minLinkFlowShift
                 || merge->LPlink == NO_PATH_EXISTS)
             { /* Also nothing to do */
-                pushBackFlowMerge_par(merge, network, bushes, origin);
+                pushBackFlowMerge_par(merge, network, bushes, t);
             } else {
                 newtonFlowShift_par(j,merge,origin,network,bushes,parameters);
             }
@@ -368,6 +373,7 @@ void updateFlowPass_par(int origin, network_type *network, bushes_type *bushes,
  * from the OD matrix, and splitting flows as needed.
  */
 void calculateBushFlows_par(int origin,network_type *network,bushes_type *bushes) {
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
 
     int i, j, ij, m, node;
     merge_type *merge;
@@ -375,13 +381,13 @@ void calculateBushFlows_par(int origin,network_type *network,bushes_type *bushes
 
     /* Initialize node flows with OD matrix */
     for (i = 0; i < network->numZones; i++) {
-        bushes->nodeFlow_par[origin][i] = network->demand[origin][i];
+        bushes->nodeFlow_par[t][i] = network->demand[origin][i];
     }
     for (; i < network->numNodes; i++) {
-        bushes->nodeFlow_par[origin][i] = 0;
+        bushes->nodeFlow_par[t][i] = 0;
     }
     for (ij = 0; ij < network->numArcs; ij++) {
-        bushes->flow_par[origin][ij] = 0;
+        bushes->flow_par[t][ij] = 0;
     }
 
     /* Descending pass for flow calculations  */
@@ -393,7 +399,7 @@ void calculateBushFlows_par(int origin,network_type *network,bushes_type *bushes
         } else {
             m = pred2merge(bushes->pred[origin][j]);
             merge = bushes->merges[origin][m];
-            pushBackFlowMerge_par(merge, network, bushes, origin);
+            pushBackFlowMerge_par(merge, network, bushes, t);
         }
     }
 
@@ -405,18 +411,21 @@ void calculateBushFlows_par(int origin,network_type *network,bushes_type *bushes
  */
 inline void pushBackFlowSimple_par(int j, int origin, network_type *network,
                         bushes_type *bushes) {
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
 
     int i, ij;
 
     ij = bushes->pred[origin][j];
     i = network->arcs[ij].tail;
-    bushes->flow_par[origin][ij] = bushes->nodeFlow_par[origin][j];
-    bushes->nodeFlow_par[origin][i] += bushes->nodeFlow_par[origin][j];
+    bushes->flow_par[t][ij] = bushes->nodeFlow_par[t][j];
+    bushes->nodeFlow_par[t][i] += bushes->nodeFlow_par[t][j];
 }
 
 /*
  * pushBackFlowMerge_par -- the harder way to split flow, when there are multiple
- * approaches to a merge node.
+ * approaches to a merge node.  IVES FORK: t_id is the scratch row, i.e. the
+ * worker index (thpool_worker_id); upstream's callers passed the origin, which
+ * was the same row only while rows were per origin (IVES-FORK.md 16).
  */
 inline void pushBackFlowMerge_par(merge_type *merge, network_type *network,
                        bushes_type *bushes, int t_id) {
@@ -438,7 +447,8 @@ inline void pushBackFlowMerge_par(merge_type *merge, network_type *network,
 /*
  * rectifyMerge_par -- to guard against numerical errors at a particular merge
  * node, recalculates the approach proportions.  In the degenerate case of zero
- * node flow, push everything onto the shortest path.
+ * node flow, push everything onto the shortest path.  IVES FORK: t_id is the
+ * worker index, as for pushBackFlowMerge_par.  (No caller.)
  */
 void rectifyMerge_par(int j, merge_type *merge, bushes_type *bushes, int t_id) {
 
@@ -469,6 +479,7 @@ void rectifyMerge_par(int j, merge_type *merge, bushes_type *bushes, int t_id) {
 void newtonFlowShift_par(int j, merge_type *merge, int origin,
                      network_type *network, bushes_type *bushes,
                      algorithmBParameters_type *parameters) {
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
     double flow1, flow2, cost1, cost2, der1, der2, shift;
     int i, hi, m, c;
     merge_type *segmentMerge;
@@ -566,7 +577,7 @@ void newtonFlowShift_par(int j, merge_type *merge, int origin,
             segmentMerge->approachFlow[segmentMerge->LPlink] -= shift;
         }
         exactCostUpdate_par(hi, -shift, network, c);
-        bushes->flow_par[origin][hi] -= shift;
+        bushes->flow_par[t][hi] -= shift;
         i = network->arcs[hi].tail;
     }
     i = j;
@@ -580,7 +591,7 @@ void newtonFlowShift_par(int j, merge_type *merge, int origin,
             segmentMerge->approachFlow[segmentMerge->SPlink] += shift;
         }
         exactCostUpdate_par(hi, shift, network, c);
-        bushes->flow_par[origin][hi] += shift;
+        bushes->flow_par[t][hi] += shift;
         i = network->arcs[hi].tail;
     }
     for (int k = 0; k < network->numArcs; ++k) {
@@ -594,7 +605,9 @@ void newtonFlowShift_par(int j, merge_type *merge, int origin,
 /*
  * checkFlows_par -- an error-checking routine which can be invoked to see if flow
  * conservation is properly maintained on the bushes.  In the release
- * implementation, all calls to this function are commented out.
+ * implementation, all calls to this function are commented out.  IVES FORK:
+ * t_id is the calling worker's index (thpool_worker_id): calculateBushFlows_par
+ * writes that worker's scratch row, which the checks below then read.
  */
 #define FLOW_TOLERANCE 1e-5
 void checkFlows_par(network_type *network, bushes_type *bushes, int t_id) {
@@ -681,9 +694,10 @@ void classUpdate_par(int hi, int class, double shift,  network_type *network) {
 /*
  * IVES FORK: initialBushShortestPath_par -- the per-origin half of the pooled
  * initializeBushesB (bush.c).  Identical to initialBushShortestPath except that
- * the shortest-path labels go into this origin's own SPcost_par row rather than
- * the single shared bushes->SPcost scratch vector, which is the only thing
- * standing between the stock loop and independence.  Everything else it writes
+ * the shortest-path labels go into a SPcost_par row rather than the single
+ * shared bushes->SPcost scratch vector, which is the only thing standing
+ * between the stock loop and independence.  (The row is the running worker's
+ * since IVES-FORK.md 16; it was this origin's.)  Everything else it writes
  * -- pred[origin], bushOrder[origin], numMerges[origin], lastMerge[origin] --
  * is already per-origin upstream, and arcIndexBellmanFord allocates its own
  * queue and reads the network read-only.
@@ -696,9 +710,10 @@ void classUpdate_par(int hi, int class, double shift,  network_type *network) {
 void initialBushShortestPath_par(int origin, network_type *network,
                                  bushes_type *bushes,
                                  algorithmBParameters_type *parameters) {
+    const int t = thpool_worker_id; /* IVES FORK: scratch row, IVES-FORK.md 16 */
     int ij, originNode = origin2node(network, origin);
 
-    arcIndexBellmanFord(originNode, bushes->SPcost_par[origin],
+    arcIndexBellmanFord(originNode, bushes->SPcost_par[t],
                         bushes->pred[origin], network,
                         parameters->SPQueueDiscipline);
     for (ij = 0; ij < network->numNodes; ij++) {
@@ -712,8 +727,17 @@ void initialBushShortestPath_par(int origin, network_type *network,
     parameters->topologicalOrder(origin, network, bushes, parameters);
 }
 
+/* IVES FORK: the scratch rows are per worker (IVES-FORK.md 16); every pool
+ * entry checks it is running on a pool thread whose row exists. */
+void checkScratchRow(bushes_type *bushes) {
+    if (thpool_worker_id < 0 || thpool_worker_id >= bushes->numScratchRows)
+        fatalError("Bush task on thread index %d, outside the %d scratch rows",
+                   thpool_worker_id, bushes->numScratchRows);
+}
+
 void initBushPool(void* pVoid) {
     struct thread_args *args = (struct thread_args *) pVoid;
+    checkScratchRow(args->bushes);
     initialBushShortestPath_par(args->id, args->network, args->bushes,
                                 args->parameters);
     calculateBushFlows_par(args->id, args->network, args->bushes);
@@ -725,6 +749,7 @@ void updateBushPool(void* pVoid) {
     bushes_type *bushes = args->bushes;
     network_type *network = args->network;
     algorithmBParameters_type *parameters = args->parameters;
+    checkScratchRow(bushes);
     updateBushB_par(id, network, bushes, parameters);
 }
 
@@ -734,6 +759,7 @@ void updateFlowsPool(void* pVoid) {
     bushes_type *bushes = args->bushes;
     network_type *network = args->network;
     algorithmBParameters_type *parameters = args->parameters;
+    checkScratchRow(bushes);
     args->update_flows_ret |= updateFlowsB_par(id, network, bushes, parameters);
 }
 #else

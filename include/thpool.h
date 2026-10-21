@@ -17,6 +17,17 @@ extern "C" {
 
 typedef struct thpool_* threadpool;
 
+/* IVES FORK: worker index.  Each pool thread sets this to its 0-based index
+ * (0 .. num_threads-1) before serving any job; every other thread -- the main
+ * thread included -- reads -1.  tap-b's Algorithm B indexes its per-worker
+ * scratch rows with it (IVES-FORK.md 16), so a task's index is that of the
+ * thread running it, without threading an id through every task signature. */
+extern __thread int thpool_worker_id;
+
+/* IVES FORK: the num_threads the pool was created with (its scratch row
+ * count). */
+int thpool_num_threads(threadpool);
+
 
 /**
  * @brief  Initialize threadpool

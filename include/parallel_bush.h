@@ -37,6 +37,7 @@ void updateBushPool(void* pVoid);
 void updateFlowsPool(void* pVoid);
 /* IVES FORK: pooled initial-bush construction (see initializeBushesB) */
 void initBushPool(void* pVoid);
+void checkScratchRow(bushes_type *bushes); /* IVES FORK */
 void initialBushShortestPath_par(int origin, network_type *network,
                                  bushes_type *bushes,
                                  algorithmBParameters_type *parameters);

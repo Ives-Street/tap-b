@@ -80,6 +80,7 @@ typedef struct thpool_{
     thread**   threads;                  /* pointer to threads        */
     volatile int num_threads_alive;      /* threads currently alive   */
     volatile int num_threads_working;    /* threads currently working */
+    int num_threads;                     /* IVES FORK: as created     */
     pthread_mutex_t  thcount_lock;       /* used for thread count etc */
     pthread_cond_t  threads_all_idle;    /* signal to thpool_wait     */
     jobqueue  jobqueue;                  /* job queue                 */
@@ -116,6 +117,14 @@ static void  bsem_wait(struct bsem *bsem_p);
 /* ========================== THREADPOOL ============================ */
 
 
+/* IVES FORK: worker index; see thpool.h */
+__thread int thpool_worker_id = -1;
+
+int thpool_num_threads(thpool_* thpool_p){
+    return thpool_p->num_threads;
+}
+
+
 /* Initialise thread pool */
 struct thpool_* thpool_init(int num_threads){
 
@@ -134,6 +143,7 @@ struct thpool_* thpool_init(int num_threads){
         return NULL;
     }
     thpool_p->num_threads_alive   = 0;
+    thpool_p->num_threads         = num_threads; /* IVES FORK */
     thpool_p->num_threads_working = 0;
 
     /* Initialise the job queue */
@@ -315,6 +325,10 @@ static void thread_hold(int sig_id) {
 * @return nothing
 */
 static void* thread_do(struct thread* thread_p){
+
+    /* IVES FORK: worker index (thpool.h), set before this thread serves any
+     * job and never changed. */
+    thpool_worker_id = thread_p->id;
 
     /* Set thread name for profiling and debuging */
     char thread_name[128] = {0};
