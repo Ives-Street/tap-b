@@ -358,9 +358,6 @@ void setActiveOrigins(network_type *network,
         off = "<THRESHOLD GAP> > 0";
     } else if (!(parameters->minLinkFlow >= 0)) {
         off = "<MIN LINK FLOW> < 0";
-    } else if (parameters->warmStart == TRUE
-               || parameters->storeBushes == TRUE) {
-        off = "bush file I/O not yet subset-aware";
     }
     network->skipEmpty = (off == NULL) ? TRUE : FALSE;
 

@@ -470,7 +470,10 @@ void displayMergeDLL(int minVerbosity, mergeDLL *list);
 
 /**** Batching ****/
 void writeBushes(network_type *network, bushes_type *bushes, char *filename);
-void readBushes(network_type *network, bushes_type **bushes, char *filename);
+/* IVES FORK: id-driven, reads full and subset files; returns the number of
+   active origins the file lacks, flagged FALSE in loaded[] (IVES-FORK.md 18) */
+int readBushes(network_type *network, bushes_type **bushes, char *filename,
+               bool *loaded);
 void readBinaryMatrix(network_type *network,
                       algorithmBParameters_type *parameters);
 void writeOriginVehLength(network_type *network, bushes_type *bushes,

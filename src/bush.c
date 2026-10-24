@@ -662,6 +662,10 @@ algorithmBParameters_type initializeAlgorithmBParameters() {
     return parameters;
 }
 
+static void initializeMissingBushes(network_type *network, bushes_type *bushes,
+                                    algorithmBParameters_type *parameters,
+                                    const bool *loaded); /* IVES FORK 18 */
+
 void initializeAlgorithmB(network_type *network, bushes_type **bushes,
                           algorithmBParameters_type *parameters) {
 
@@ -705,7 +709,15 @@ void initializeAlgorithmB(network_type *network, bushes_type **bushes,
         /* Form bush structure: either read from file or recreate */
         if (parameters->warmStart == TRUE) { /* Read file and rectify */
             displayMessage(FULL_NOTIFICATIONS, "Reading batch %d\n", batch);
-            readBushes(network, bushes, batchFileName);
+            /* IVES FORK: the bush file may hold every origin or a subset,
+             * and the set of origins with demand may have changed since it
+             * was written (IVES-FORK.md 18).  Active origins it lacks are
+             * built cold here, each under its own class's costs, before the
+             * loading loop below; with the empty set unchanged nothing is
+             * built and no class switch is made that 81d8e14 did not make. */
+            declareVector(bool, loaded, network->batchSize);
+            int numMissing = readBushes(network, bushes, batchFileName,
+                                        loaded);
             /* IVES FORK: prove-it-fired marker, like the preload and pooled-
              * init lines.  A warm start that silently fell back to a cold
              * build is invisible in the results (same equilibrium) and shows
@@ -713,6 +725,10 @@ void initializeAlgorithmB(network_type *network, bushes_type **bushes,
             displayMessage(LOW_NOTIFICATIONS,
                            "Warm start: bushes loaded from %s\n",
                            batchFileName);
+            if (numMissing > 0) {
+                initializeMissingBushes(network, *bushes, parameters, loaded);
+            }
+            deleteVector(loaded);
         } else { /* No warm start, have to re-initialize */
             /* Do we have to create a bush from scratch, or can we reuse
              * the first? */
@@ -778,7 +794,7 @@ void loadBatch(int batch, network_type *network, bushes_type **bushes,
     if (network->numBatches > 1) {
         /* Even if storeBushes == TRUE, if there is only one batch
          * there is no point in reading it again */
-        readBushes(network, bushes, batchFileName);
+        readBushes(network, bushes, batchFileName, NULL);
     }
     if (network->numBatches > 1 || parameters->storeMatrices == TRUE) {
         readBinaryMatrix(network, parameters);
@@ -1611,6 +1627,66 @@ void deleteBushes(network_type *network, bushes_type *bushes) {
     deleteScalar(bushes);
 }
 
+
+/*
+ * IVES FORK: initializeMissingBushes -- a warm start's cold build for the
+ * active origins its bush file lacked (loaded[origin] == FALSE; IVES-FORK.md
+ * 18): typically an origin that had no demand when the file was written.
+ * The same construction as initializeBushesB -- the free-flow shortest-path
+ * tree under the origin's own class's costs, pooled where initializeBushesB
+ * pools -- but switching class costs only for classes with a bush to build,
+ * so origins read from the file are untouched.  Runs before
+ * initializeAlgorithmB's loading loop, where every active origin's flows are
+ * then loaded in ascending order.
+ */
+static void initializeMissingBushes(network_type *network, bushes_type *bushes,
+                                    algorithmBParameters_type *parameters,
+                                    const bool *loaded) {
+    int c, origin, lastClass = IS_MISSING, nBuilt = 0;
+    bool pooled = FALSE;
+#ifdef PARALLELISM
+    pooled = parameters->serialBushInit == FALSE
+             && parameters->createInitialBush == &initialBushShortestPath
+             && parameters->topologicalOrder == &genericTopologicalOrder;
+    struct thread_args *args = newVector(network->batchSize,
+                                         struct thread_args);
+#endif
+    for (origin = 0; origin < network->batchSize; origin++) {
+        if (outOfOrigins(network, origin) == TRUE) break;
+        if (network->isActive[origin] == FALSE || loaded[origin] == TRUE)
+            continue;
+        c = origin2class(network, origin);
+        if (c != lastClass) {
+#ifdef PARALLELISM
+            thpool_wait(thpool); /* drain, then switch (IVES-FORK.md 14) */
+#endif
+            changeFixedCosts(network, c);
+            lastClass = c;
+        }
+        nBuilt++;
+#ifdef PARALLELISM
+        if (pooled == TRUE) {
+            args[origin].id = origin;
+            args[origin].network = network;
+            args[origin].bushes = bushes;
+            args[origin].parameters = parameters;
+            args[origin].update_flows_ret = FALSE;
+            thpool_add_work(thpool, (void (*)(void *)) initBushPool,
+                            (void *) &args[origin]);
+            continue;
+        }
+#endif
+        parameters->createInitialBush(origin, network, bushes, parameters);
+        calculateBushFlows(origin, network, bushes);
+    }
+#ifdef PARALLELISM
+    thpool_wait(thpool);
+    deleteVector(args);
+#endif
+    displayMessage(LOW_NOTIFICATIONS, "Warm start: built %d bushes cold "
+                   "(%s; origins not in the bush file)\n", nBuilt,
+                   pooled == TRUE ? "pooled" : "serial");
+}
 
 /*
  * initializeBushesB -- set up initial bushes at the beginning of the algorithm
@@ -2615,9 +2691,13 @@ void writeBushes(network_type *network, bushes_type *bushes, char *filename) {
     check = network->batchSize;
     fwrite(&check, sizeof(check), 1, batchFile);
     
-    /* Now write each origin in turn */
+    /* Now write each origin in turn.  IVES FORK: active origins only, in
+     * ascending order, each behind its id tag as before -- the subset bush
+     * file (IVES-FORK.md 18).  The header is unchanged, so a run with no
+     * empty origin writes the byte-identical file 81d8e14 wrote. */
     for (origin = 0; origin < network->batchSize; origin++) {
         if (outOfOrigins(network, origin) == TRUE) break;
+        if (network->isActive[origin] == FALSE) continue;
 
         /* First write the origin ID as a check */
         check = origin + network->batchSize * network->curBatch;
@@ -2656,8 +2736,20 @@ void writeBushes(network_type *network, bushes_type *bushes, char *filename) {
     fclose(batchFile);
 }
 
-void readBushes(network_type *network, bushes_type **bushes, char *filename) {
-    int m, origin, check, numApproaches;
+/*
+ * readBushes -- IVES FORK: id-driven, for the subset bush file (IVES-FORK.md
+ * 18).  Reads a file with every origin (81d8e14's, or ours with no empty
+ * origin) or only some, in ascending id order.  A stored bush whose origin is
+ * now inactive is read and discarded.  An active origin absent from the file
+ * is reported through loaded[] (FALSE) and the return value, for the caller
+ * to build cold; with loaded == NULL (multi-batch reloads, where nothing can
+ * be built mid-run) an absent origin is fatal, as it always was.  Ids out of
+ * range or out of order are refused with 81d8e14's message.
+ */
+int readBushes(network_type *network, bushes_type **bushes, char *filename,
+               bool *loaded) {
+    int m, origin, check, numApproaches, prev = -1, numRead = 0, numMissing;
+    int numDiscarded = 0, discardCap = 0, *discard = NULL;
     merge_type *merge;
     FILE *batchFile = openFile(filename, "rb");
     
@@ -2671,15 +2763,44 @@ void readBushes(network_type *network, bushes_type **bushes, char *filename) {
     /* First clear out all existing bush data */
     deleteBushes(network, *bushes);
     *bushes = createBushes(network);
+    declareVector(bool, seen, network->batchSize);
+    for (origin = 0; origin < network->batchSize; origin++)
+        seen[origin] = FALSE;
     
-    /* Now read each origin in turn */
-    for (origin = 0; origin < network->batchSize; origin++) {
-        if (outOfOrigins(network, origin) == TRUE) break;
-        /* First read the origin ID and check */
-        my_fread(&check, sizeof(check), 1, batchFile);
-        if (check != origin + network->batchSize * network->curBatch) {
+    /* Now read each stored origin in turn, by its id tag */
+    while (fread(&check, sizeof(check), 1, batchFile) == 1) {
+        origin = check - network->batchSize * network->curBatch;
+        if (origin <= prev || origin >= network->batchSize
+                || outOfOrigins(network, origin) == TRUE) {
             fatalError("Reading wrong origin from file %s.", filename);
-        }        
+        }
+        prev = origin;
+        if (network->isActive[origin] == FALSE) {
+            /* No demand now: read the stored bush past, keep nothing */
+            int lastMerge, numMerges;
+            my_fread(&lastMerge, sizeof(lastMerge), 1, batchFile);
+            my_fread(&numMerges, sizeof(numMerges), 1, batchFile);
+            if (discardCap < 2 * network->numNodes) {
+                discardCap = 2 * network->numNodes;
+                deleteVector(discard);
+                discard = newVector(discardCap, int);
+            }
+            my_fread(discard, sizeof(int), 2 * network->numNodes, batchFile);
+            for (m = 0; m < numMerges; m++) {
+                my_fread(&numApproaches, sizeof(numApproaches), 1, batchFile);
+                merge = createMerge(numApproaches);
+                my_fread(merge->approach, sizeof(merge->approach[0]),
+                         numApproaches, batchFile);
+                my_fread(merge->approachFlow, sizeof(merge->approachFlow[0]),
+                         numApproaches, batchFile);
+                my_fread(discard, sizeof(int), 3, batchFile);
+                deleteMerge(merge);
+            }
+            numDiscarded++;
+            continue;
+        }
+        seen[origin] = TRUE;
+        numRead++;
         
         /* Now read last merge and number of merges*/
         my_fread(&(*bushes)->lastMerge[origin],sizeof((*bushes)->lastMerge[0]),
@@ -2714,8 +2835,27 @@ void readBushes(network_type *network, bushes_type **bushes, char *filename) {
             (*bushes)->merges[origin][m] = merge;        
         }
     }
-            
+    if (ferror(batchFile)) fatalError("Error reading from file %s.", filename);
     fclose(batchFile);
+    deleteVector(discard);
+
+    numMissing = 0;
+    for (origin = 0; origin < network->batchSize; origin++) {
+        if (outOfOrigins(network, origin) == TRUE) break;
+        if (network->isActive[origin] == FALSE) continue;
+        if (seen[origin] == FALSE) numMissing++;
+        if (loaded != NULL) loaded[origin] = seen[origin];
+    }
+    deleteVector(seen);
+    if (numMissing > 0 && loaded == NULL) {
+        fatalError("File %s has no stored bush for %d origins with demand.",
+                   filename, numMissing);
+    }
+    displayMessage(LOW_NOTIFICATIONS, "Warm start bush file: %d bushes read, "
+                   "%d discarded (origin now without demand), %d to build "
+                   "cold (origin not in the file)\n", numRead, numDiscarded,
+                   numMissing);
+    return numMissing;
 }
 
 /*

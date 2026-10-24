@@ -74,7 +74,7 @@ CASES = []
 
 def case(name, net, trips, preload, gap, maxit, kind, large=False, extra=(),
          solve_gap=None, totals_gate=True, class_toll=None, golden=None,
-         ref=None, expect=None, rows_only=False, empties=0):
+         ref=None, expect=None, rows_only=False, empties=0, **warm):
     """gap: the target.  For single-class cases it is also the solve's
     <CONVERGENCE GAP>.  For multi-class cases it is the per-class gate the
     oracle applies to *every* class, and solve_gap is the (tighter) aggregate
@@ -92,6 +92,7 @@ def case(name, net, trips, preload, gap, maxit, kind, large=False, extra=(),
     c = spec(name, net, trips, preload, gap, maxit, kind, large, extra,
              solve_gap, totals_gate, class_toll, golden, ref, expect,
              rows_only, empties)
+    c.update(warm)
     CASES.append(c)
     return c
 
@@ -189,6 +190,18 @@ case("SF_allempty_1", SF, ["SiouxFalls_empty_lo.txt"], None, 1e-9, 300,
 case("SF_allempty_2", SF, ["SiouxFalls_empty_lo.txt",
                            "SiouxFalls_empty_hi.txt"], None, 1e-9, 300,
      "ident", empties=48)
+# Outside the exactness argument the skip is off (counter 0, "skip off:
+# <reason>") and the solve is 81d8e14's, byte for byte: several batches,
+# <LINK COST UPDATE> LINEAR, <THRESHOLD GAP> > 0.  (<MIN LINK FLOW> < 0 is the
+# fourth condition; no case, it is the same guard.)
+case("SF_dj2_linear", SF, SFD["dj2"][0], None, 1e-8, 300, "ident",
+     solve_gap=1e-9, extra=["<LINK COST UPDATE> LINEAR"], skip_off=True)
+case("SF_dj2_threshold", SF, SFD["dj2"][0], None, 1e-8, 300, "ident",
+     solve_gap=1e-9, extra=["<THRESHOLD GAP> 1e-6"], skip_off=True)
+case("Anaheim2_2batch", "Anaheim2_net.tntp",
+     ["Anaheim2_trips1.tntp", "Anaheim2_trips2.tntp"], None, 1e-6, 300,
+     "ident", solve_gap=1e-10, extra=["<NUMBER OF BATCHES> 2"],
+     skip_off=True, no_vehlen=True)
 # The pre-existing multi-class cases, byte-compared with 81d8e14 as well
 # (their oracle cases above stay): no empties, so the skip must be a no-op.
 _lohi = ["SiouxFalls_k_lo.txt", "SiouxFalls_k_hi.txt"]
@@ -208,6 +221,105 @@ case("Chicago_dj3", "ChicagoRegional_net.txt",
      ["ChicagoRegional_dj3_0.txt", "ChicagoRegional_dj3_1.txt",
       "ChicagoRegional_dj3_2.txt"], None, 1e-5, 100, "oracle", large=True,
      solve_gap=1e-6, totals_gate=False, empties=3599)
+
+# Bush files and warm starts across a change in the empty set (IVES-FORK.md
+# 18; G-WARM).  The bush file holds active origins only, behind their id tags
+# under the unchanged header; the reader takes every origin or a subset,
+# discards a stored bush whose origin has no demand now, and builds cold any
+# active origin the file lacks.  Problems, 2 classes on tolled SiouxFalls:
+#   base  lo without origin 7 + hi on origins 13-24      13 of 48 empty
+#   add   lo full + hi on origins 12-24                  11 of 48 empty
+#   drop  lo without origins 7 and 11 + hi on 13-24      14 of 48 empty
+# Seeds: 81d8e14's own bush file for base, committed (test/golden/warm/), and
+# this binary's sparse file for base, written in the run.  kinds:
+#   bushfile  a <STORE BUSHES> solve: its bush file `cmp`-identical to
+#             81d8e14's for the same problem ("identical") or smaller
+#             ("smaller")
+#   warm      a <WARM START> solve from the seed: the warm-start marker and
+#             the reader's line (`expect`) must print; "golden" -> flows,
+#             veh-length and log extract byte-identical to 81d8e14's own warm
+#             solve from the same file (test/golden/ident/); otherwise every
+#             class at the oracle's target and total link flows within
+#             --flow-tol of a cold solve of the same problem.
+_base = ["SiouxFalls_warm_add.txt", "SiouxFalls_dj2_b.txt"]
+_add = ["SiouxFalls_warm_full.txt", "SiouxFalls_warm_hi_add.txt"]
+_drop = ["SiouxFalls_warm_drop.txt", "SiouxFalls_dj2_b.txt"]
+# The seeds are solved loosely (1e-3), so every warm solve below still has
+# iterations to do -- a seed at the target would leave the warm run one
+# iteration, comparing little beyond the initialisation.
+WARM_BASE = spec("SF_warm_base", SF, _base, None, 1e-8, 300, "seed",
+                 solve_gap=1e-3, extra=["<STORE BUSHES>"], empties=13)
+LEGACY_SEED = "SF_warm_base_loose.81d8e14.bush"
+case("SF_bush_noempty", SF, _lohi, None, 1e-8, 300, "bushfile",
+     solve_gap=1e-9, extra=["<STORE BUSHES>"], bush="identical",
+     bush_golden="SF_tolled_2class.81d8e14.bush")
+case("SF_bush_sparse", SF, _base, None, 1e-8, 300, "bushfile",
+     solve_gap=1e-9, extra=["<STORE BUSHES>"], empties=13, bush="smaller",
+     bush_golden="SF_warm_base.81d8e14.bush")
+case("SF_bush_sparse_loose", SF, _base, None, 1e-8, 300, "bushfile",
+     solve_gap=1e-3, extra=["<STORE BUSHES>"], empties=13, bush="smaller",
+     bush_golden=LEGACY_SEED)
+# (d) 81d8e14's file, empty set unchanged: byte-identical to 81d8e14's warm run
+case("SF_warm_legacy_same", SF, _base, None, 1e-8, 300, "warm",
+     solve_gap=1e-9, extra=["<WARM START>"], empties=13, seed_golden=
+     LEGACY_SEED, golden_ident=True,
+     expect=[r"Warm start: bushes loaded from",
+             r"Warm start bush file: 35 bushes read, 13 discarded .*, "
+             r"0 to build cold"])
+# (a) 81d8e14's file read for a different empty set: every stored bush is
+# there, so origins now active are read (the stored empty bush, rectified, as
+# 81d8e14 itself would) and none is built
+case("SF_warm_legacy_add", SF, _add, None, 1e-8, 300, "warm",
+     solve_gap=1e-9, extra=["<WARM START>"], empties=11,
+     seed_golden=LEGACY_SEED,
+     cold=spec("SF_warm_add_cold", SF, _add, None, 1e-8, 300, "cold",
+               solve_gap=1e-9, empties=11),
+     expect=[r"Warm start: bushes loaded from",
+             r"Warm start bush file: 37 bushes read, 11 discarded .*, "
+             r"0 to build cold"])
+# (b) this binary's sparse file, demand added at two previously empty
+# origins (7 in class 1, 12 in class 2): both built cold, each under its own
+# class's costs
+case("SF_warm_add", SF, _add, None, 1e-8, 300, "warm", solve_gap=1e-9,
+     extra=["<WARM START>"], empties=11, seed_run=WARM_BASE,
+     cold=spec("SF_warm_add_cold", SF, _add, None, 1e-8, 300, "cold",
+               solve_gap=1e-9, empties=11),
+     expect=[r"Warm start: bushes loaded from",
+             r"Warm start bush file: 35 bushes read, 0 discarded .*, "
+             r"2 to build cold",
+             r"Warm start: built 2 bushes cold"])
+# (c) the same file, origin 11 of class 1 zeroed: its stored bush discarded
+case("SF_warm_drop", SF, _drop, None, 1e-8, 300, "warm", solve_gap=1e-9,
+     extra=["<WARM START>"], empties=14, seed_run=WARM_BASE,
+     cold=spec("SF_warm_drop_cold", SF, _drop, None, 1e-8, 300, "cold",
+               solve_gap=1e-9, empties=14),
+     expect=[r"Warm start: bushes loaded from",
+             r"Warm start bush file: 34 bushes read, 1 discarded .*, "
+             r"0 to build cold"])
+
+# A sparse file whose missing origins all come last (class 2 has no demand):
+# warm-starts this binary unchanged, and is the file 81d8e14 refuses at end
+# of file rather than by id (identity mode).  All-empty: a header-only file.
+_ecl = ["SiouxFalls_k_lo.txt", "SiouxFalls_empty_hi.txt"]
+case("SF_warm_eclast", SF, _ecl, None, 1e-8, 300, "warm", solve_gap=1e-9,
+     extra=["<WARM START>"], empties=24,
+     seed_run=spec("SF_eclast_seed", SF, _ecl, None, 1e-8, 300, "seed",
+                   solve_gap=1e-3, extra=["<STORE BUSHES>"], empties=24),
+     cold=spec("SF_eclast_cold", SF, _ecl, None, 1e-8, 300, "cold",
+               solve_gap=1e-9, empties=24),
+     expect=[r"Warm start: bushes loaded from",
+             r"Warm start bush file: 24 bushes read, 0 discarded .*, "
+             r"0 to build cold"])
+_ae = ["SiouxFalls_empty_lo.txt", "SiouxFalls_empty_hi.txt"]
+case("SF_warm_allempty", SF, _ae, None, 1e-8, 300, "warm", solve_gap=1e-9,
+     extra=["<WARM START>"], empties=48,
+     seed_run=spec("SF_allempty_seed", SF, _ae, None, 1e-8, 300, "seed",
+                   solve_gap=1e-9, extra=["<STORE BUSHES>"], empties=48),
+     cold=spec("SF_allempty_cold", SF, _ae, None, 1e-8, 300, "cold",
+               solve_gap=1e-9, empties=48),
+     expect=[r"Warm start: bushes loaded from",
+             r"Warm start bush file: 0 bushes read, 0 discarded .*, "
+             r"0 to build cold"])
 
 # <CLASS TOLL FILE> (IVES-FORK.md 17).  SF_ct_exempt: class 2 (4 min/$) is
 # exempt on the 8 tolled links incident to node 16 and pays $5 on the 8
@@ -261,7 +373,9 @@ COUNTER = re.compile(r"^Empty origins skipped: (\d+) of (\d+)", re.M)
 
 
 def wants_vehlen(c, identity=False):
-    return identity or c["kind"] == "ident"
+    if c.get("no_vehlen"):  # several batches: the file is refused there
+        return False
+    return identity or c["kind"] == "ident" or bool(c.get("golden_ident"))
 
 
 def write_run(c, rundir, threads, vehlen=False):
@@ -291,8 +405,14 @@ def write_run(c, rundir, threads, vehlen=False):
         f.write("\n".join(lines) + "\n")
 
 
-def run(binary, c, rundir, threads, vehlen=False):
+BUSH = "batch0.bin"  # <BATCH STEM> default, one batch
+
+
+def run(binary, c, rundir, threads, vehlen=False, seed=None):
+    """seed: a bush file to warm-start from, copied in as the run's own."""
     write_run(c, rundir, threads, vehlen)
+    if seed:
+        shutil.copyfile(seed, os.path.join(rundir, BUSH))
     t0 = time.time()
     with open(os.path.join(rundir, "log.txt"), "w") as log:
         rc = subprocess.call([binary, "params.txt"], cwd=rundir, stdout=log,
@@ -327,6 +447,8 @@ def check_counter(c, log):
     got = counter(log)
     if got is None:
         return "no 'Empty origins skipped' line"
+    if c.get("skip_off") and "(skip off:" not in log:
+        return "skip should be off"
     if got[0] != c["empties"]:
         return "skip counter %d, expected %d" % (got[0], c["empties"])
     return ""
@@ -336,6 +458,79 @@ def cmp_files(a, b):
     """Byte comparison via cmp(1); (identical?, cmp's output)."""
     p = subprocess.run(["cmp", a, b], capture_output=True, text=True)
     return p.returncode == 0, (p.stdout + p.stderr).strip()
+
+
+def warm_golden(name):
+    return os.path.join(GOLDEN, "warm", name)
+
+
+def warm_seed(binary, c, work):
+    """The bush file case c warm-starts from: a committed 81d8e14 golden, or
+    one this binary writes from a cold <STORE BUSHES> solve, run here."""
+    if c.get("seed_golden"):
+        return warm_golden(c["seed_golden"]), None
+    sd = os.path.join(work, "seed", c["seed_run"]["name"])
+    rc, _, log, _ = run(binary, c["seed_run"], sd, 1)
+    if rc != 0 or not os.path.exists(os.path.join(sd, BUSH)):
+        return None, "seed solve %s exited %d" % (c["seed_run"]["name"], rc)
+    return os.path.join(sd, BUSH), None
+
+
+def oracle(c, rd):
+    args = [sys.executable, ORACLE, os.path.join(rd, c["net"]),
+            os.path.join(rd, "flows.txt")]
+    args += [os.path.join(rd, t) for t in c["trips"]]
+    if c["preload"]:
+        args += ["--preload", os.path.join(rd, c["preload"])]
+    if c["class_toll"]:
+        args += ["--class-toll", os.path.join(rd, c["class_toll"])]
+    args += ["--max-gap", "%g" % c["gap"]]
+    p = subprocess.run(args, capture_output=True, text=True)
+    open(os.path.join(rd, "oracle.txt"), "w").write(p.stdout + p.stderr)
+    gaps = re.findall(r"ORACLE_CLASS_GAP (\d+) \S+ \S+ (\S+)", p.stdout)
+    return p.returncode == 0, gaps, (p.stdout + p.stderr).strip()
+
+
+def check_warm(a, c, rd, log, tag, info):
+    """kind "warm": markers, then the golden identity or the cold comparison.
+    Returns the number of failures."""
+    missing = [e for e in c["expect"] if not re.search(e, log)]
+    if missing:
+        print("FAIL %s log lacks /%s/  %s" % (tag, "/, /".join(missing), info))
+        return 1
+    if c.get("golden_ident"):
+        res = []
+        for what, path in [("flows", os.path.join(rd, "flows.txt")),
+                           ("vehlen", os.path.join(rd, VEHLEN))]:
+            res.append((what,) + cmp_files(path, ident_golden(c, what)))
+        elog = os.path.join(rd, "log_extract.txt")
+        with open(elog, "w") as f:
+            f.write(log_extract(log))
+        res.append(("log",) + cmp_files(elog, ident_golden(c, "log")))
+        ok = all(r[1] for r in res)
+        print("%s %s warm: %s 81d8e14's warm golden  %s" % (
+            "ok  " if ok else "FAIL", tag,
+            ", ".join("%s %s" % (w, "==" if same else "!= (" + o + ")")
+                      for w, same, o in res), info))
+        return 0 if ok else 1
+    ok, gaps, out = oracle(c, rd)
+    crd = os.path.join(a.work, "check-t1", c["cold"]["name"])
+    crc, _, clog, clast = run(a.bin, c["cold"], crd, 1)
+    if crc != 0 or clast is None:
+        print("FAIL %s cold reference exited %d" % (tag, crc))
+        return 1
+    A = flows_table(os.path.join(rd, "flows.txt"))
+    B = flows_table(os.path.join(crd, "flows.txt"))
+    dtot = max(abs(x[0] - y[0]) for x, y in zip(A, B))
+    ok = ok and len(A) == len(B) and dtot <= a.flow_tol
+    print("%s %s warm: oracle gaps %s (target %g); max |total - cold| %.3e "
+          "(tol %g); cold iter %d  %s" % (
+              "ok  " if ok else "FAIL", tag,
+              " ".join("%.2e" % float(g) for _, g in gaps), c["gap"], dtot,
+              a.flow_tol, clast[0], info))
+    if not ok and out:
+        print("     " + out.splitlines()[-1])
+    return 0 if ok else 1
 
 
 def ident_golden(c, what):
@@ -379,17 +574,29 @@ def cmd_golden(a):
     os.makedirs(GOLDEN, exist_ok=True)
     sums = read_checksums()
     for c in selected(a):
-        if c["kind"] not in ("file", "md5", "ident") or c["class_toll"]:
+        if c["kind"] not in ("file", "md5", "ident", "bushfile", "warm") \
+                or c["class_toll"]:
+            continue
+        if c["kind"] == "warm" and not c.get("golden_ident"):
             continue
         rd = os.path.join(a.work, "golden", c["name"])
-        rc, wall, log, last = run(a.bin, c, rd, 1, wants_vehlen(c))
+        seed = warm_golden(c["seed_golden"]) if c["kind"] == "warm" else None
+        rc, wall, log, last = run(a.bin, c, rd, 1, wants_vehlen(c), seed)
         if rc != 0:
             sys.exit("%s: tap-b exited %d" % (c["name"], rc))
         fl = os.path.join(rd, "flows.txt")
-        if c["kind"] == "ident":
+        if c["kind"] == "bushfile":
+            # 81d8e14's bush file for the problem: the seed of the legacy
+            # warm cases and the reference of the bush-file cases
+            os.makedirs(os.path.join(GOLDEN, "warm"), exist_ok=True)
+            shutil.copyfile(os.path.join(rd, BUSH),
+                            warm_golden(c["bush_golden"]))
+        elif c["kind"] in ("ident", "warm"):
             os.makedirs(os.path.join(GOLDEN, "ident"), exist_ok=True)
             shutil.copyfile(fl, ident_golden(c, "flows"))
-            shutil.copyfile(os.path.join(rd, VEHLEN), ident_golden(c, "vehlen"))
+            if wants_vehlen(c):
+                shutil.copyfile(os.path.join(rd, VEHLEN),
+                                ident_golden(c, "vehlen"))
             with open(ident_golden(c, "log"), "w") as f:
                 f.write(log_extract(log))
         elif c["kind"] == "file":
@@ -411,7 +618,15 @@ def cmd_check(a):
     for c in selected(a):
         threads = 1 if c["kind"] != "oracle" else a.threads
         rd = os.path.join(a.work, "check-t%d" % threads, c["name"])
-        rc, wall, log, last = run(a.bin, c, rd, threads, wants_vehlen(c))
+        seed = None
+        if c["kind"] == "warm":
+            seed, err = warm_seed(a.bin, c, a.work)
+            if err:
+                print("FAIL %-28s %s" % (c["name"], err))
+                fails += 1
+                continue
+        rc, wall, log, last = run(a.bin, c, rd, threads, wants_vehlen(c),
+                                  seed)
         fl = os.path.join(rd, "flows.txt")
         tag = "%-28s t=%-2d" % (c["name"], threads)
         if c["kind"] == "reject":
@@ -439,7 +654,23 @@ def cmd_check(a):
                   % (tag, info))
             fails += 1
             continue
-        if c["kind"] == "same":
+        if c["kind"] == "warm":
+            fails += check_warm(a, c, rd, log, tag, info)
+        elif c["kind"] == "bushfile":
+            mine, gold = os.path.join(rd, BUSH), warm_golden(c["bush_golden"])
+            if c["bush"] == "identical":
+                ok, out = cmp_files(mine, gold)
+                txt = "bush file %s 81d8e14's (%d bytes)%s" % (
+                    "==" if ok else "!=", os.path.getsize(mine),
+                    "" if ok else ": " + out)
+            else:
+                sm, sg = os.path.getsize(mine), os.path.getsize(gold)
+                ok = sm < sg
+                txt = "bush file %d bytes %s 81d8e14's %d" % (
+                    sm, "<" if ok else ">=", sg)
+            print("%s %s %s  %s" % ("ok  " if ok else "FAIL", tag, txt, info))
+            fails += not ok
+        elif c["kind"] == "same":
             r = c["ref"]
             rrd = os.path.join(a.work, "check-t1", r["name"])
             rrc, rwall, rlog, rlast = run(a.bin, r, rrd, 1)
@@ -466,6 +697,8 @@ def cmd_check(a):
             res = []
             for what, path in [("flows", fl),
                                ("vehlen", os.path.join(rd, VEHLEN))]:
+                if what == "vehlen" and not wants_vehlen(c):
+                    continue
                 res.append((what,) + cmp_files(path, ident_golden(c, what)))
             elog = os.path.join(rd, "log_extract.txt")
             with open(elog, "w") as f:
@@ -546,15 +779,21 @@ def cmd_identity(a):
     for c in selected(a):
         if c["kind"] == "reject":
             continue
+        if c["kind"] == "warm" and c.get("seed_run"):
+            fails += identity_refuse_sparse(a, c)
+            continue
         if a.solve_gap:
             # A looser solve for the large cases at 1 thread: the trajectory
             # is compared step for step, so identity is as sharp per
             # iteration; only fewer iterations are covered.
             c = dict(c, solve_gap=a.solve_gap)
         out = {}
+        seed = (warm_golden(c["seed_golden"]) if c["kind"] == "warm"
+                else None)
         for who, b in (("new", a.bin), ("ref", a.ref_bin)):
             rd = os.path.join(a.work, "identity", who, c["name"])
-            rc, wall, log, last = run(b, c, rd, 1, vehlen=True)
+            rc, wall, log, last = run(b, c, rd, 1,
+                                      vehlen=wants_vehlen(c, True), seed=seed)
             elog = os.path.join(rd, "log_extract.txt")
             with open(elog, "w") as f:
                 f.write(log_extract(log))
@@ -575,12 +814,33 @@ def cmd_identity(a):
             m = COUNTER.search(out["new"][2])
             lines.append("counter: " + out["new"][2][m.start():].splitlines()[0])
         for what in ("flows.txt", VEHLEN, "log_extract.txt"):
+            if what == VEHLEN and not wants_vehlen(c, True):
+                continue
             pa = os.path.join(out["new"][0], what)
             pb = os.path.join(out["ref"][0], what)
             same, txt = cmp_files(pa, pb)
             ok = ok and same
             lines.append("cmp %s: %s" % (what, "identical (%d bytes)"
                          % os.path.getsize(pa) if same else txt))
+        if c["kind"] == "bushfile":
+            pa = os.path.join(out["new"][0], BUSH)
+            pb = os.path.join(out["ref"][0], BUSH)
+            same, txt = cmp_files(pa, pb)
+            if c["bush"] == "identical":
+                ok = ok and same
+                lines.append("cmp %s: %s" % (BUSH, "identical (%d bytes)"
+                             % os.path.getsize(pa) if same else txt))
+            else:
+                sa, sb = os.path.getsize(pa), os.path.getsize(pb)
+                ok = ok and sa < sb
+                lines.append("%s: new %d bytes, ref %d bytes (%s); cmp: %s"
+                             % (BUSH, sa, sb, "smaller" if sa < sb
+                                else "NOT smaller", txt or "identical"))
+        if c["kind"] == "warm":
+            m = [e for e in c["expect"] if not re.search(e, out["new"][2])]
+            ok = ok and not m
+            lines.append("warm markers: %s" % ("all present" if not m else
+                                               "MISSING /" + "/, /".join(m)))
         if out["new"][3] != out["ref"][3]:
             ok = False
         lines.append("iterations new %s ref %s" % (out["new"][3][0],
@@ -591,6 +851,31 @@ def cmd_identity(a):
         fails += not ok
     print("%d failure(s)" % fails)
     return 1 if fails else 0
+
+
+REFUSALS = [r"Reading wrong origin from file",
+            r"Error reading from file\. Expecting 1 bytes, read 0"]
+
+
+def identity_refuse_sparse(a, c):
+    """G-WARM (e): the reference binary (81d8e14) given a sparse bush file
+    this binary wrote must exit nonzero with one of its two refusals."""
+    seed, err = warm_seed(a.bin, c, os.path.join(a.work, "identity"))
+    tag = "%-28s" % c["name"]
+    if err:
+        print("FAIL %s %s" % (tag, err))
+        return 1
+    rd = os.path.join(a.work, "identity", "ref", c["name"])
+    rc, wall, log, last = run(a.ref_bin, c, rd, 1, seed=seed)
+    fatal = [l for l in log.splitlines() if "Fatal error" in l
+             or "Error reading" in l or "wrong origin" in l]
+    ok = rc != 0 and any(re.search(r, log) for r in REFUSALS)
+    print("%s %s reference on this binary's sparse bush file (%d bytes): "
+          "exit %d" % ("ok  " if ok else "FAIL", tag, os.path.getsize(seed),
+                       rc))
+    for l in fatal[:3]:
+        print("     " + l)
+    return 0 if ok else 1
 
 
 def main():
