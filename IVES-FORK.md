@@ -14,7 +14,9 @@ a cyclic bush and crash (section 10); and multi-class runs no longer switch one
 class's tolls in under another class's queued work (section 14). Section 16 is
 a memory fix: the parallel build's scratch is per worker thread, not per
 origin. Section 17 is a second input feature: an optional per-class toll on
-every link, the seam an exempt class (HOV) will use.
+every link, the seam an exempt class (HOV) will use. Section 18 skips
+(origin, class) pairs with no demand — no bush at all — while keeping every
+result byte-identical at one thread.
 
 **Base commit:** `040135a20c771fbb84766df6a97cff981fa5df4b` (upstream `master`,
 2024-09-22). **Our branch:** `ives/main`. Upstream stays as the `upstream`
@@ -947,6 +949,226 @@ absorbs the links (gaps 8.7e-10 / 7.2e-10, oracle agreeing). Three cautions:
 
 Connectome does not use this pattern; it is documented for the future HOV
 work only.
+
+### 18. `src/bush.c`, `src/fileio.c`, `include/` — no bush for an (origin, class) pair with no demand
+
+**What.** An (origin, class) pair whose trips row sums to exactly 0 is
+*inactive*. It gets no bush: no rows are allocated for it (its `pred`,
+`bushOrder` and `merges` rows are `NULL`, `numMerges` 0), and it gets no
+initial tree, no bush update, no flow pass and no SPTT scan. Its
+`<ORIGIN VEH LENGTH FILE>` row is still written, with the zeros 81d8e14
+printed. The bush file stores active origins only (format below).
+
+**Why.** Band pricing makes classes that have demand at only part of the
+origins: at Washington DC, K = 4, each of the three band classes has demand
+at 1,561 of 3,311 origins, and ~5,360 of 13,244 bushes carry no demand.
+Those bushes were not cheap. An empty bush's convergence test in
+`rescanAndCheck` is `bushExcess / bushSPTT` = 0/0 = NaN, which never compares
+below the threshold, so an empty bush never retires: it runs all 20 inner
+flow passes every outer iteration (review R0: ~97 % of the DC band run's
+flow passes were on empty bushes), plus its share of the init, the gap
+evaluation's SPTT, the bush file and memory.
+
+**The active set.** `setActiveOrigins` (fileio.c) runs once at the end of
+`readParametersFile`, after the trips are read and the batches set. It
+builds `network->isActive[origin]`, the ascending list `activeOrigins`,
+`classHasEmpty[class]` and `skipEmpty`, and prints
+
+```
+Empty origins skipped: 23 of 48 (per class: 11, 12)
+```
+
+N counts inactive (origin, class) pairs, M is zones × classes. An origin
+whose only demand is intrazonal is active (its row sum is not 0). Every
+per-origin array stays indexed by origin; each origin loop tests
+`isActive`. Since `readOBANetwork` refuses negative demand and
+`readParametersFile` a negative multiplier, "row sum exactly 0" is "every
+entry 0".
+
+**Exactness.** At `<NUMBER OF THREADS> 1` every result is byte-identical to
+81d8e14's — flows, `CLASS_GAP`, the `Iteration` lines (gap, objective,
+count; not the time or the shift count) and the origin veh-length file —
+by this argument:
+
+1. An empty bush carries no flow. Every contribution it made — to an arc's
+   `flow` and `classFlow` in the loading loop, to SPTT and the per-class
+   SPTT, to TSTT, to entropy, to the veh-length sums — is `+= 0.0`, which
+   leaves any double unchanged (no −0.0 arises: arc flows start at +0 and a
+   sum of opposite values is +0). Summation order over the active origins
+   is the old order with zero terms removed.
+2. An empty bush's tasks write nothing shared. `updateBushB` rewrites only
+   its own bush. In `updateFlowsB` every merge approach of an empty bush has
+   flow 0, which is not "used" under `<MIN LINK FLOW>` ≥ 0, so `LPlink`
+   stays `NO_PATH_EXISTS` and `newtonFlowShift` — the only caller of the
+   cost update on a flow shift — is never reached. The shift counter
+   (`numFlowShifts`) is printed only; it feeds no stopping rule.
+3. What an empty bush *did* change was the **class-cost switch** its
+   dispatch triggered. `changeFixedCosts(c)` updates costs incrementally
+   (`cost += new − old`), so the sequence of switches moves link costs by an
+   ulp, and that moves the trajectory. Measured by R0 on 81d8e14: SiouxFalls
+   K = 1 plus an all-empty class at a *different* toll factor moves 71 of 76
+   links by up to 3.5e-4 veh (at the same toll factor nothing moves). So the
+   patch keeps 81d8e14's switch sequence exactly: in every dispatcher
+   (`initializeBushesB`, pooled and serial; both loops of
+   `updateBatchBushes`; `updateBatchFlows`; `bushSPTT`, pooled and serial)
+   an inactive origin is a task that makes its class switch — the same
+   `thpool_wait` + `changeFixedCosts`, at the same position in origin order
+   — does no work, and, in `updateBatchFlows`, returns TRUE. It stays
+   `updateBush == TRUE` as the empty bush did, so it keeps triggering its
+   switch in every inner pass, and it keeps `doneAny` TRUE, so the inner
+   passes run as many times as before (81d8e14 ran all 20 whenever any
+   empty bush existed). A fully empty class still gets its switch.
+
+Point 2 holds only inside the defaults, so the skip is **engaged only when**
+there is one batch (several batches keep rows on disk and use `bushTSTT`;
+connectome always writes one); `<LINK COST UPDATE>` is `EXACT` (otherwise
+every bush scan, empty ones included, recomputes every link cost);
+`<THRESHOLD GAP>` ≤ 0 (otherwise `rescanAndCheck` can retire an empty bush,
+which then stops triggering its switch); and `<MIN LINK FLOW>` ≥ 0. Outside
+them every origin is active, the solve is 81d8e14's, and the counter line
+says why: `Empty origins skipped: 0 of 76 (skip off: 2 batches)`. All four
+are defaults and connectome sets none of them. (The ladder checks the three
+reachable ones byte-identical to 81d8e14 with the skip off. Measured, on
+`SF_dj2`, the `LINEAR` and `THRESHOLD GAP` guards are not needed — a build
+without them is still byte-identical there — so they are conservative: the
+argument does not cover those settings, and nothing we run uses them.)
+
+How sharp the gates are, measured. A build that skips inactive origins
+*before* their class switch (the obvious patch) fails 5 of the multi-class
+identity cases (`SF_dj2`, `SF_dj3`, `SF_emptyclass_first/last`, Anaheim2);
+single-class cases are unaffected, as point 3 predicts. A build that keeps
+the switches but not the forced `doneAny` passes every case: the extra
+switch-only passes happen (148 of them on `SF_dj3`) but repeat a cost round
+trip that is already idempotent after its first application on these
+fixtures. The forcing is kept because the argument needs it; no fixture
+here shows it.
+
+Threaded runs are non-deterministic as before (section "A note on
+reproducibility"); the skip changes nothing about that.
+
+**Bush file (`<STORE BUSHES>` / `<WARM START>`).** Same header (the batch
+size), same per-origin record behind the same id tag, but only active
+origins are written, in ascending order. A run without empty origins writes
+the byte-identical file 81d8e14 writes. `readBushes` is now id-driven:
+
+- a full file (81d8e14's) or a subset file is read; ids must ascend and be
+  in range, else `Reading wrong origin from file …` as before;
+- a stored bush whose origin has **no demand now** is read past and
+  discarded;
+- an **active origin absent from the file** (typically: it had no demand
+  when the file was written) is built cold inside `initializeAlgorithmB`
+  (`initializeMissingBushes`), before the flow-loading loop: the free-flow
+  shortest-path tree under its own class's costs (`changeFixedCosts(c)`, as
+  the cold path does), pooled where the cold init pools. The loading loop
+  then rectifies and loads every active origin in ascending order.
+- With the empty set unchanged nothing is built and no class switch is made
+  that 81d8e14 does not make — its warm path makes none.
+- A multi-batch reload (`loadBatch`) still requires every origin.
+
+The reader prints its line just before the existing
+`Warm start: bushes loaded from …` marker:
+
+```
+Warm start bush file: 35 bushes read, 0 discarded (origin now without demand), 2 to build cold (origin not in the file)
+Warm start: bushes loaded from ./batch0.bin
+Warm start: built 2 bushes cold (pooled; origins not in the bush file)
+```
+
+(The third line only when something is built. None of them contains
+`Parallel bush init engaged`.)
+
+**81d8e14 refuses a subset file**, loudly, exit 1 — verbatim:
+
+```
+Fatal error: Reading wrong origin from file ./batch0.bin.
+```
+
+when a missing origin precedes a stored one, and
+
+```
+Fatal error: Error reading from file. Expecting 1 bytes, read 0 bytes
+```
+
+when the missing origins all come last, or the file is header-only (every
+origin empty). A file with no empty origin is byte-identical and loads in
+either binary. Connectome's warm cache therefore must not hand a file from
+this binary to 81d8e14 (a downgrade); it fails loudly, never silently.
+
+**Two log counts changed meaning.** `Parallel SPTT path engaged (N origins,
+…)` and `Parallel bush init engaged (N origins)` now count the origins
+actually scanned / built — active ones — not zones × classes.
+
+**Parser note (F7, not fixed).** `readParametersFile` loops on
+`while (!feof(…))`, so the parameters file's *last* tag is processed twice.
+A trailing `<TRIPS FILE>` therefore adds that class twice. Harmless for every
+other tag we use; never end a parameters file with `<TRIPS FILE>`
+(connectome's ends with other tags; `run_check.py` ends with `<FLOWS FILE>`
+or a case's extras).
+
+**Tests** (`make check` / `check-quick`; fixtures from `make_fixtures.py`,
+goldens from 81d8e14 in `test/golden/ident/` and `test/golden/warm/`):
+
+- every case asserts the counter line with the case's known number of empty
+  pairs (Braess 3, ChicagoSketch 1, Barcelona 13, ChicagoRegional 19,
+  Anaheim2 34; a no-op skip would pass every identity check);
+- `ident` cases, 1 thread, `cmp` of flows, veh-length file and the log
+  extract (`CLASS_GAP` and `Iteration` lines without time and shifts)
+  against 81d8e14's output: `SF_dj2` (disjoint halves at 0.5 / 4.0 min/$,
+  one intrazonal-only origin), `SF_dj3` (interleaved thirds at 0.5 / 4.0 /
+  0), `SF_emptyclass_last` / `_first` (stock demand plus a class with no
+  demand at another toll factor — the reference is 81d8e14 on the same
+  input, not the K = 1 run), `SF_allempty_1` / `_2`, the existing small
+  multi-class cases, and the three skip-off cases; each new multi-class
+  fixture is also an oracle case at `THREADS`;
+- bush files: no empties → `cmp`-identical to 81d8e14's; with empties →
+  smaller (11,900 vs 15,192 bytes on the warm base);
+- warm starts, 1 thread: 81d8e14's file with the empty set unchanged →
+  byte-identical to 81d8e14's own warm solve; 81d8e14's file and this
+  binary's file under a changed empty set (demand added at an empty origin
+  of each class, both built cold; an origin zeroed, its bush discarded;
+  missing origins last; all empty) → oracle per-class gap ≤ 1e-8 and total
+  flows within 0.1 veh of a cold solve, with the markers above present;
+- `run_check.py identity --ref-bin <81d8e14>` runs every case live against
+  the reference binary and has it read this binary's subset files,
+  asserting one of the two refusals.
+
+`tools/mcgap.py` now reads a class with no demand as gap 0 (tap-b's
+`CLASS_GAP` convention); it raised `ZeroDivisionError`.
+
+**Not covered.** `<CALCULATE BINS>` (DEBUG-only reduced-cost bins) no
+longer counts empty bushes' arcs. `<SELFTEST INJECT CYCLE>` injects into
+the first *active* bush. An empty origin from which some zone is
+unreachable gave 81d8e14 a NaN SPTT term (0 × ∞); it now adds nothing —
+theoretical, the network is made strongly connected.
+
+**Memory, measured.** ChicagoRegional (12,982 nodes, 39,033 arcs, 1,790
+zones), three classes on disjoint origin sets — origin o in class
+(o − 1) mod 3, stock demand unscaled, toll factors 2 / 10 / 0 min/$
+(`Chicago_dj3` in the ladder) — so 3,599 of 5,370 (origin, class) pairs have
+no demand: 67 %. 12 threads, `<CONVERGENCE GAP> 1e-6`, `<STORE BUSHES>`,
+`/usr/bin/time -v` on the tap-b process, 81d8e14 and this section back to back
+on the same inputs:
+
+| | 81d8e14 | this section | change |
+|---|---|---|---|
+| peak RSS | 2,663,992 kB | 953,492 kB | **−64.2 %** |
+| bush file | 596,419,808 B | 202,037,708 B | −66.1 % |
+| bushes built (`Parallel bush init engaged`) | 5,370 | 1,771 | −67.0 % |
+| iterations / final gap | 19 / 9.52e-7 | 21 / 8.01e-7 | (12 threads: non-deterministic) |
+| flow shifts (run total, the `Iteration` line's counter) | 1,428,374 | 63,720 | −95.5 % |
+| user CPU | 2,060 s | 730 s | −64.6 % |
+| oracle per-class gap (`mcgap.py`) | 7.29e-7 / 1.37e-6 / 7.14e-7 | 6.80e-7 / 1.16e-6 / 5.26e-7 | both ≤ 1e-5 |
+
+The ceiling the plan priced — the bush share of memory falls by at most the
+empty fraction — is −67 % here; the measured −64 % sits just under it, so on
+this network nearly all of the RSS that scales with origins is bushes. (The
+plan's −30 to −40 % was priced for Washington DC, where 40 % of pairs are
+empty; there ~5.7 GB of the 14.9 GB RSS was not bushes, so expect a smaller
+share there.) The shift count falls by more than the bush count because empty
+bushes were the ones that never retired (above). Wall times — 6:00 vs 3:14 —
+are from dev1 under a load average of 16–26 on 12 cores and are not
+comparable; user CPU is the steadier figure. tap-b's own `CLASS_GAP` agrees
+with the oracle to ~1e-11 relative in both runs.
 
 ## Not upstreamed (yet)
 
