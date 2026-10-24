@@ -861,6 +861,9 @@ void deleteNetwork(network_type *network) {
 #endif
    deleteVector(network->tollFactor);
    deleteVector(network->distanceFactor);
+   deleteVector(network->isActive); /* IVES FORK, IVES-FORK.md 18 */
+   deleteVector(network->activeOrigins);
+   deleteVector(network->classHasEmpty);
    deleteScalar(network);
 }
 

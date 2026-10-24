@@ -249,7 +249,14 @@ def main():
                                  "path over real arcs" % (c + 1, o, j, v))
                     sptt += v * dist[j]
                     dem += v
-        gap = (tstt - sptt) / sptt
+        if sptt == 0:
+            # A class with no demand (IVES-FORK.md 18): tap-b's CLASS_GAP
+            # reports 0 for it.  Flow without demand is an error.
+            if tstt != 0:
+                sys.exit("class %d has no demand but TSTT %g" % (c + 1, tstt))
+            gap = 0.0
+        else:
+            gap = (tstt - sptt) / sptt
         worst = max(worst, gap)
         tolled = sum(xk[i] for i in range(len(arcs)) if toll[i] > 0)
         print("class%d tollF=%g distF=%g demand=%.1f TSTT=%.10g SPTT=%.10g "

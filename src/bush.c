@@ -540,6 +540,7 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
      * is O(origins x arcs). */
     if (verbosity >= DEBUG) {
         for (int i = 0; i < network->numZones; i++) {
+            if (network->isActive[i] == FALSE) continue; /* IVES FORK 18 */
             calculateBushFlows(i, network, bushes);
 #if PARALLELISM
             printBush(DEBUG, i, network, bushes, bushes->flow,
@@ -727,6 +728,10 @@ void initializeAlgorithmB(network_type *network, bushes_type **bushes,
          *  2. To get the initial arc flows correct
          */
         for (origin = 0; origin < network->batchSize; origin++) {
+            /* IVES FORK: an inactive origin has no bush; its flow was
+             * += 0.0 on every arc (IVES-FORK.md 18).  Active origins load
+             * in ascending order, as before. */
+            if (network->isActive[origin] == FALSE) continue;
             rectifyBushFlows(origin, network, *bushes);
             c = origin2class(network, origin);
             for (ij = 0; ij < network->numArcs; ij++) {
@@ -816,9 +821,13 @@ void updateBatchBushes(network_type *network, bushes_type *bushes,
             thpool_wait(thpool);
             changeFixedCosts(network, c);
         }
+        *lastClass = c;
+        /* IVES FORK: an inactive origin keeps the class switch its empty
+         * bush's dispatch made in 81d8e14, and nothing else (IVES-FORK.md
+         * 18).  Likewise in every dispatcher below. */
+        if (network->isActive[j] == FALSE) continue;
         thpool_add_work(thpool, (void (*)(void *)) updateBushPool,
                         (void*)&args[j]);
-        *lastClass = c;
     }
     thpool_wait(thpool);
 
@@ -830,9 +839,10 @@ void updateBatchBushes(network_type *network, bushes_type *bushes,
             thpool_wait(thpool); /* IVES FORK: drain first, as above */
             changeFixedCosts(network, c);
         }
+        *lastClass = c;
+        if (network->isActive[j] == FALSE) continue; /* IVES FORK 18 */
         thpool_add_work(thpool, (void (*)(void *)) updateFlowsPool, 
                         (void*)&args[j]);
-        *lastClass = c;
     }
     thpool_wait(thpool);
 #else
@@ -844,9 +854,10 @@ void updateBatchBushes(network_type *network, bushes_type *bushes,
         if (c != *lastClass) {
             changeFixedCosts(network, c);
         }
+        *lastClass = c;
+        if (network->isActive[origin] == FALSE) continue; /* IVES FORK 18 */
         updateBushB(origin, network, bushes, parameters);
         updateFlowsB(origin, network, bushes, parameters);
-        *lastClass = c;
     }
 #endif
 }
@@ -875,12 +886,21 @@ void updateBatchFlows(network_type *network, bushes_type *bushes,
                 thpool_wait(thpool); /* IVES FORK: drain first */
                 changeFixedCosts(network, c);
             }
-            thpool_add_work(thpool, (void (*)(void *)) updateFlowsPool,
-                            (void*)&args[j]);
             /* IVES FORK: upstream never advanced lastClass in this branch, so
              * every origin whose class differed from the entry class re-ran
              * the O(arcs) changeFixedCosts (IVES-FORK.md 14). */
             *lastClass = c;
+            /* IVES FORK: an inactive origin is the task 81d8e14's empty bush
+             * was: its switch above, no work, and a TRUE return -- an empty
+             * bush's convergence test is 0/0, so it never retires and keeps
+             * every inner pass running (IVES-FORK.md 18).  Its updateBush
+             * stays TRUE, as the empty bush's did. */
+            if (network->isActive[j] == FALSE) {
+                doneAny = TRUE;
+                continue;
+            }
+            thpool_add_work(thpool, (void (*)(void *)) updateFlowsPool,
+                            (void*)&args[j]);
         }
         thpool_wait(thpool);
 
@@ -896,8 +916,12 @@ void updateBatchFlows(network_type *network, bushes_type *bushes,
             if (c != *lastClass) {
                 changeFixedCosts(network, c);
             }
-            doneAny |= updateFlowsB(origin,network,bushes,parameters);
             *lastClass = c;
+            if (network->isActive[origin] == FALSE) { /* IVES FORK 18 */
+                doneAny = TRUE;
+                continue;
+            }
+            doneAny |= updateFlowsB(origin,network,bushes,parameters);
         }
 #endif
         if (doneAny == FALSE) break;
@@ -1201,7 +1225,7 @@ double bushSPTT(network_type *network, bushes_type *bushes,
         double psptt = 0;
         int spClass = IS_MISSING;
         spttArgs_type *args = newVector(network->batchSize, spttArgs_type);
-        int nQueued = 0;
+        int nQueued = 0, nScanned = 0; /* IVES FORK 18: all / active */
         readSPTQueueDiscipline(); /* serial, before any worker reads sptQueue */
         for (r = 0; r < network->batchSize; r++) {
             if (outOfOrigins(network, r) == TRUE) break;
@@ -1211,16 +1235,22 @@ double bushSPTT(network_type *network, bushes_type *bushes,
                 changeFixedCosts(network, c);
                 spClass = c;
             }
+            /* IVES FORK: an inactive origin's SPTT term was demand 0 x label,
+             * += 0.0; only its class's switch above is kept (IVES-FORK.md
+             * 18).  Its args row stays a zero term in the sums below, in
+             * origin order. */
+            args[r].sptt = 0;
+            args[r].tScan = 0;
+            args[r].tBF = 0;
+            nQueued++;
+            if (network->isActive[r] == FALSE) continue;
+            nScanned++;
             args[r].origin = r;
             args[r].network = network;
             args[r].bushes = bushes;
             args[r].parameters = parameters;
-            args[r].sptt = 0;
-            args[r].tScan = 0;
-            args[r].tBF = 0;
             thpool_add_work(thpool, (void (*)(void *)) bushSPTTPool,
                             (void *) &args[r]);
-            nQueued++;
         }
         thpool_wait(thpool);
         for (r = 0; r < nQueued; r++) psptt += args[r].sptt;
@@ -1248,7 +1278,7 @@ double bushSPTT(network_type *network, bushes_type *bushes,
          * environment, so a log records which arm actually ran. */
         displayMessage(LOW_NOTIFICATIONS,
                        "Parallel SPTT path engaged (%d origins, queue %s)\n",
-                       nQueued, sptQueueName);
+                       nScanned, sptQueueName);
         return psptt;
     }
 #endif
@@ -1265,6 +1295,10 @@ double bushSPTT(network_type *network, bushes_type *bushes,
         c = origin2class(network, r);
         if (c != lastClass) {
             changeFixedCosts(network, c);
+        }
+        if (network->isActive[r] == FALSE) { /* IVES FORK 18: switch only */
+            lastClass = c;
+            continue;
         }
         scanBushes(r, network, bushes, parameters, NO_LONGEST_PATH);
         BellmanFord_NoLabel(originNode, bushes->SPcost, network, DEQUE,
@@ -1364,6 +1398,10 @@ double bushTSTT(network_type *network, bushes_type *bushes,
         if (c != lastClass) {
             changeFixedCosts(network, c);
         }
+        lastClass = c;
+        /* IVES FORK: multi-batch only, where every origin is active
+         * (IVES-FORK.md 18); the guard keeps a NULL row unreachable. */
+        if (network->isActive[r] == FALSE) continue;
         calculateBushFlows(r, network, bushes);
         rtstt = 0; /* IVES FORK: per-class report, separate accumulator */
         for (ij = 0; ij < network->numArcs; ij++) {
@@ -1371,7 +1409,6 @@ double bushTSTT(network_type *network, bushes_type *bushes,
             rtstt += bushes->flow[ij] * network->arcs[ij].cost;
         }
         if (classTSTT != NULL) classTSTT[c] += rtstt;
-        lastClass = c;
     }
     return tstt;
 }
@@ -1435,6 +1472,9 @@ double bushEntropy(network_type *network, bushes_type *bushes,
     double entropy = 0.0;
     for (r = 0; r < network->batchSize; r++) {
         if (outOfOrigins(network, r) == TRUE) break;
+        /* IVES FORK: an empty bush adds no term (no flow reaches
+         * minLinkFlow); inactive origins have none (IVES-FORK.md 18) */
+        if (network->isActive[r] == FALSE) continue;
         calculateBushFlows(r, network, bushes);
         for (ij = 0; ij < network->numArcs; ij++) {
             if (isInBush(r, ij, network, bushes) == TRUE && bushes->flow[ij] >= parameters->minLinkFlow && bushes->nodeFlow[network->arcs[ij].head] >= parameters->minLinkFlow) {
@@ -1471,6 +1511,7 @@ double bushMEC(network_type *network, bushes_type *bushes,
         if (c != lastClass) {
             changeFixedCosts(network, c);
         }
+        if (network->isActive[r] == FALSE) continue; /* IVES FORK 18 */
         scanBushes(r, network, bushes, parameters, LONGEST_USED_PATH);
         BellmanFord_NoLabel(originNode, bushes->SPcost, network, DEQUE,
                             bushes->SPcost, bushes->bushOrder[r]);
@@ -1495,8 +1536,18 @@ bushes_type *createBushes(network_type *network) {
     bushes->SPcost = newVector(network->numNodes, double);
     bushes->flow = newVector(network->numArcs, double);
     bushes->nodeFlow = newVector(network->numNodes, double);
-    bushes->pred = newMatrix(network->batchSize, network->numNodes, int);
-    bushes->bushOrder = newMatrix(network->batchSize, network->numNodes, int);
+    /* IVES FORK: rows only for active origins; an inactive origin's pred,
+     * bushOrder and merges rows are NULL, so any site that still reaches one
+     * crashes in the ladder instead of reading an empty bush (IVES-FORK.md
+     * 18).  With the skip off every origin is active: upstream's allocation. */
+    bushes->pred = newVector(network->batchSize, int *);
+    bushes->bushOrder = newVector(network->batchSize, int *);
+    for (i = 0; i < network->batchSize; i++) {
+        bool active = network->isActive[i];
+        bushes->pred[i] = active ? newVector(network->numNodes, int) : NULL;
+        bushes->bushOrder[i] = active ? newVector(network->numNodes, int)
+                                      : NULL;
+    }
     bushes->lastMerge = newVector(network->batchSize, int);
     bushes->numMerges = newVector(network->batchSize, int);
     bushes->merges = newVector(network->batchSize, merge_type**);
@@ -1518,7 +1569,9 @@ bushes_type *createBushes(network_type *network) {
 #endif
     for (i = 0; i < network->batchSize; i++) {
        bushes->numMerges[i] = 0;
-       bushes->merges[i] = newVector(1, merge_type*);
+       bushes->lastMerge[i] = 0;
+       bushes->merges[i] = network->isActive[i] ? newVector(1, merge_type*)
+                                                : NULL; /* IVES FORK 18 */
        bushes->updateBush[i] = TRUE;
     }
     return bushes;
@@ -1539,6 +1592,8 @@ void deleteBushes(network_type *network, bushes_type *bushes) {
     deleteMatrix(bushes->bushOrder, network->batchSize);
     deleteVector(bushes->lastMerge);
     for (i = 0; i < network->batchSize; i++) {
+        /* IVES FORK: an inactive origin's row is NULL with numMerges 0, and
+         * free(NULL) (killMatrix, deleteVector) is a no-op (IVES-FORK.md 18) */
         for (m = 0; m < bushes->numMerges[i]; m++) {
             deleteMerge(bushes->merges[i][m]);
         }
@@ -1617,6 +1672,9 @@ void initializeBushesB(network_type *network, bushes_type *bushes,
                 changeFixedCosts(network, c);
                 lastClass = c;
             }
+            /* IVES FORK: no bush for an inactive origin, only its class's
+             * switch (IVES-FORK.md 18) */
+            if (network->isActive[origin] == FALSE) continue;
             args[origin].id = origin;
             args[origin].network = network;
             args[origin].bushes = bushes;
@@ -1642,6 +1700,7 @@ void initializeBushesB(network_type *network, bushes_type *bushes,
             changeFixedCosts(network, c);
         }
         lastClass = c;
+        if (network->isActive[origin] == FALSE) continue; /* IVES FORK 18 */
         /* createInitialBush also sets preds, bushOrder */
         parameters->createInitialBush(origin, network, bushes, parameters);
         calculateBushFlows(origin, network, bushes);
@@ -2288,6 +2347,7 @@ void checkFlows(network_type *network, bushes_type *bushes) {
    
     for (r = 0; r < network->batchSize; r++) {
         if (outOfOrigins(network, r) == TRUE) break;
+        if (network->isActive[r] == FALSE) continue; /* IVES FORK 18 */
         calculateBushFlows(r, network, bushes);
         /* First check bush flow consistency */
         for (ij = 0; ij < network->numArcs; ij++) {
@@ -2711,6 +2771,9 @@ void writePathFlows(network_type *network,
     declareVector(double, linkProportion, network->numArcs);
 
     for (r = 0; r < network->numZones; r++) {
+        /* IVES FORK: an inactive origin has no demand, so 81d8e14 printed no
+         * path for it; it also has no bush to read (IVES-FORK.md 18) */
+        if (network->isActive[r] == FALSE) continue;
         /* Compute merge proportions for this bush */
         for (i = 0; i < network->numNodes; i++) {
             totalFlow = 0;
@@ -2903,12 +2966,17 @@ void writeOriginVehLength(network_type *network, bushes_type *bushes,
 
     for (r = 0; r < network->batchSize; r++) {
         if (outOfOrigins(network, r) == TRUE) break;
-        restrictedBushFlows(r, numDests, flow, nodeFlow, network, bushes);
         demand = 0;
         for (i = 0; i < numDests; i++) demand += network->demand[r][i];
         netLen = 0;
         zoneLen = 0;
+        /* IVES FORK: an inactive origin keeps its row -- connectome reads
+         * exactly zones x classes of them -- with the zeros 81d8e14's empty
+         * bush produced: no flow, so nothing to sum (IVES-FORK.md 18). */
+        if (network->isActive[r] == TRUE)
+            restrictedBushFlows(r, numDests, flow, nodeFlow, network, bushes);
         for (ij = 0; ij < network->numArcs; ij++) {
+            if (network->isActive[r] == FALSE) break;
             if (flow[ij] == 0) continue;
             x = flow[ij] * network->arcs[ij].length;
             tail = network->arcs[ij].tail;

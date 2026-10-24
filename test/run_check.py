@@ -15,6 +15,16 @@ fixtures of test/make_fixtures.py, and checks:
                 --flow-tol of the serial build's (per-class flows are not
                 unique in multi-class UE, so their difference is reported,
                 not gated).
+  empty origins every case asserts the skip's counter line
+                (IVES-FORK.md 18), "Empty origins skipped: N of M", with N
+                the case's known count of (origin, class) pairs without
+                demand -- a no-op skip would pass every identity check
+                below.  "ident" cases (the empty-origin fixtures and the
+                small multi-class ones) byte-compare, at 1 thread, the flows
+                file, the <ORIGIN VEH LENGTH FILE> output and the log's
+                CLASS_GAP and Iteration lines (time and shift count
+                stripped) with goldens written by 81d8e14, the binary before
+                the skip (test/golden/ident/).
   class tolls   <CLASS TOLL FILE> (IVES-FORK.md 17): an HOV-exempt-pattern
                 case checked per class by the oracle (which reads the file);
                 files that must not change the answer, byte-compared at 1
@@ -27,10 +37,17 @@ multi-class work (md5 a68c72f066aa9e019f273ea9ef711774, tap-b @3837de3) with
 `run_check.py golden --bin <that binary>`; regenerate them only for a change
 that is meant to move single-class flows, and say so in IVES-FORK.md.
 
+`identity --ref-bin REF` is G-ID1 of the skip-empty-origins work run against
+a live reference binary rather than goldens: every non-reject case at 1
+thread through both binaries, with `cmp` on the flows file, the origin
+veh-length file and the log extract above.
+
 Usage:
   run_check.py check  [--bin BIN] [--threads N] [--serial-bin SBIN]
                       [--only NAME[,NAME]] [--skip-large] [--work DIR]
-  run_check.py golden --bin BIN [--work DIR]
+  run_check.py identity --bin BIN --ref-bin REF [--only ...] [--skip-large]
+                         [--solve-gap G]
+  run_check.py golden --bin BIN [--only ...] [--work DIR]
   run_check.py list
 """
 import argparse
@@ -57,7 +74,7 @@ CASES = []
 
 def case(name, net, trips, preload, gap, maxit, kind, large=False, extra=(),
          solve_gap=None, totals_gate=True, class_toll=None, golden=None,
-         ref=None, expect=None, rows_only=False):
+         ref=None, expect=None, rows_only=False, empties=0):
     """gap: the target.  For single-class cases it is also the solve's
     <CONVERGENCE GAP>.  For multi-class cases it is the per-class gate the
     oracle applies to *every* class, and solve_gap is the (tighter) aggregate
@@ -69,33 +86,40 @@ def case(name, net, trips, preload, gap, maxit, kind, large=False, extra=(),
     compared with (default: its own name).  ref: for kind "same", the case
     (a dict from spec()) whose flows this one must reproduce byte for byte.
     expect: for kind "reject", a regex the log must match.  rows_only: a
-    "same" case compares the link rows only, not the summary block."""
+    "same" case compares the link rows only, not the summary block.
+    empties: the number of (origin, class) pairs with no demand -- the N the
+    skip's counter line must print (IVES-FORK.md 18)."""
     c = spec(name, net, trips, preload, gap, maxit, kind, large, extra,
              solve_gap, totals_gate, class_toll, golden, ref, expect,
-             rows_only)
+             rows_only, empties)
     CASES.append(c)
     return c
 
 
 def spec(name, net, trips, preload, gap, maxit, kind, large=False, extra=(),
          solve_gap=None, totals_gate=True, class_toll=None, golden=None,
-         ref=None, expect=None, rows_only=False):
+         ref=None, expect=None, rows_only=False, empties=0):
     return dict(name=name, net=net, trips=trips, preload=preload,
                 gap=gap, maxit=maxit, kind=kind, large=large,
                 extra=list(extra), solve_gap=solve_gap or gap,
                 totals_gate=totals_gate, class_toll=class_toll,
                 golden=golden or name, ref=ref, expect=expect,
-                rows_only=rows_only)
+                rows_only=rows_only, empties=empties)
 
 
-for _n, _kind in [("SiouxFalls", "file"), ("Braess", "file"),
-                  ("Anaheim", "file"), ("ChicagoSketch", "file"),
-                  ("Barcelona", "md5")]:
-    case(_n, "%s_net.txt" % _n, ["%s_trips.txt" % _n], None, 1e-10, 300, _kind)
+# Origins without demand in the stock trips files (IVES-FORK.md 18): Braess
+# 3 of 4, ChicagoSketch 1 of 387, Barcelona 13 of 110, ChicagoRegional 19 of
+# 1790, Anaheim2's class 2 34 of 38; SiouxFalls and Anaheim none.
+for _n, _kind, _e in [("SiouxFalls", "file", 0), ("Braess", "file", 3),
+                      ("Anaheim", "file", 0), ("ChicagoSketch", "file", 1),
+                      ("Barcelona", "md5", 13)]:
+    case(_n, "%s_net.txt" % _n, ["%s_trips.txt" % _n], None, 1e-10, 300, _kind,
+         empties=_e)
     case(_n + "_preload10", "%s_net.txt" % _n, ["%s_trips.txt" % _n],
-         "%s_preload10.txt" % _n, 1e-10, 300, _kind)
+         "%s_preload10.txt" % _n, 1e-10, 300, _kind, empties=_e)
 case("ChicagoRegional", "ChicagoRegional_net.txt",
-     ["ChicagoRegional_trips.txt"], None, 1e-4, 100, "md5", large=True)
+     ["ChicagoRegional_trips.txt"], None, 1e-4, 100, "md5", large=True,
+     empties=19)
 
 SF = "SiouxFalls_tolled_net.txt"
 # Multi-class: per-class gate `gap`, aggregate solve target `solve_gap`.
@@ -117,7 +141,7 @@ case("SF_tolled_2class_preload10", SF,
 # still sit ~10 veh from the serial build's; at 1e-13 they agree to 2e-4.
 case("Anaheim2_1batch", "Anaheim2_net.tntp",
      ["Anaheim2_trips1.tntp", "Anaheim2_trips2.tntp"], None, 1e-6, 300,
-     "oracle", solve_gap=1e-13)
+     "oracle", solve_gap=1e-13, empties=34)
 # ChicagoRegional: the serial-totals comparison is report-only.  At solve 1e-6
 # both builds are at per-class equilibrium by the oracle (<= 5e-7), yet their
 # total flows differ by up to 7.2 veh (median 0.018, diffuse, on flat-BPR
@@ -125,11 +149,65 @@ case("Anaheim2_1batch", "Anaheim2_net.tntp",
 # 0.1-veh gate is defined for the small networks only (IVES-FORK.md 15b).
 case("Chicago_2class", "ChicagoRegional_net.txt",
      ["ChicagoRegional_h2lo.txt", "ChicagoRegional_h2hi.txt"], None, 1e-5,
-     100, "oracle", large=True, solve_gap=1e-6, totals_gate=False)
+     100, "oracle", large=True, solve_gap=1e-6, totals_gate=False,
+     empties=38)
 case("Chicago_3class", "ChicagoRegional_net.txt",
      ["ChicagoRegional_t3lo.txt", "ChicagoRegional_t3hi.txt",
       "ChicagoRegional_t3free.txt"], None, 1e-5, 100, "oracle", large=True,
-     solve_gap=1e-6, totals_gate=False)
+     solve_gap=1e-6, totals_gate=False, empties=57)
+
+# Empty origins (IVES-FORK.md 18).  At 1 thread the skip must leave every
+# result byte-identical to 81d8e14, which still built, updated and scored a
+# bush for every (origin, class) pair: "ident" cases compare with 81d8e14's
+# own output (test/golden/ident/), and each multi-class one is also an oracle
+# case at THREADS.  Classes with *different* toll factors are the point:
+# 81d8e14's empty bushes moved results only through the class-cost switch
+# their dispatch triggered (changeFixedCosts is incremental), so a skip that
+# drops a switch fails here and nowhere else (R0 F1: SiouxFalls K = 1 plus an
+# all-empty class at another toll factor moves 71 of 76 links by up to 3.5e-4).
+#   dj2       disjoint origin halves, 0.5 / 4.0 min/$; origin 13 in class 1
+#             has intrazonal demand only, which is active (23 of 48 empty)
+#   dj3       interleaved thirds, 0.5 / 4.0 / 0.0 (48 of 72 empty)
+#   emptyclass_last/first  stock demand at 0.5 plus a class with no demand
+#             at all at 4.0, after / before it (the reference is 81d8e14 on
+#             the same input, not the K = 1 run, which differs)
+#   allempty  no demand anywhere, 1 and 2 classes: must not crash
+SFD = {"dj2": (["SiouxFalls_dj2_a.txt", "SiouxFalls_dj2_b.txt"], 23),
+       "dj3": (["SiouxFalls_dj3_0.txt", "SiouxFalls_dj3_1.txt",
+                "SiouxFalls_dj3_2.txt"], 48),
+       "emptyclass_last": (["SiouxFalls_k_lo.txt",
+                            "SiouxFalls_empty_hi.txt"], 24),
+       "emptyclass_first": (["SiouxFalls_empty_hi.txt",
+                             "SiouxFalls_k_lo.txt"], 24)}
+for _n, (_t, _e) in SFD.items():
+    case("SF_" + _n, SF, _t, None, 1e-8, 300, "ident", solve_gap=1e-9,
+         empties=_e)
+    case("SF_" + _n + "_oracle", SF, _t, None, 1e-8, 300, "oracle",
+         solve_gap=1e-9, empties=_e)
+case("SF_allempty_1", SF, ["SiouxFalls_empty_lo.txt"], None, 1e-9, 300,
+     "ident", empties=24)
+case("SF_allempty_2", SF, ["SiouxFalls_empty_lo.txt",
+                           "SiouxFalls_empty_hi.txt"], None, 1e-9, 300,
+     "ident", empties=48)
+# The pre-existing multi-class cases, byte-compared with 81d8e14 as well
+# (their oracle cases above stay): no empties, so the skip must be a no-op.
+_lohi = ["SiouxFalls_k_lo.txt", "SiouxFalls_k_hi.txt"]
+for _n, _t, _p in [("SF_tolled_2class", _lohi, None),
+                   ("SF_tolled_3class", _lohi + ["SiouxFalls_k_free.txt"],
+                    None),
+                   ("SF_tolled_2class_preload10", _lohi,
+                    "SiouxFalls_preload10.txt")]:
+    case(_n + "_ident", SF, _t, _p, 1e-9, 300, "ident")
+case("Anaheim2_1batch_ident", "Anaheim2_net.tntp",
+     ["Anaheim2_trips1.tntp", "Anaheim2_trips2.tntp"], None, 1e-13, 300,
+     "ident", empties=34)
+# The disjoint 3-class ChicagoRegional the memory measurement uses: origin o
+# in class (o - 1) mod 3, stock demand unscaled, toll factors 2 / 10 / 0.
+# Empty: 5,370 pairs less the 1,771 stock origins with demand = 3,599.
+case("Chicago_dj3", "ChicagoRegional_net.txt",
+     ["ChicagoRegional_dj3_0.txt", "ChicagoRegional_dj3_1.txt",
+      "ChicagoRegional_dj3_2.txt"], None, 1e-5, 100, "oracle", large=True,
+     solve_gap=1e-6, totals_gate=False, empties=3599)
 
 # <CLASS TOLL FILE> (IVES-FORK.md 17).  SF_ct_exempt: class 2 (4 min/$) is
 # exempt on the 8 tolled links incident to node 16 and pays $5 on the 8
@@ -178,7 +256,15 @@ def locate(fname):
     sys.exit("missing input %s (run test/make_fixtures.py)" % fname)
 
 
-def write_run(c, rundir, threads):
+VEHLEN = "vehlen.txt"
+COUNTER = re.compile(r"^Empty origins skipped: (\d+) of (\d+)", re.M)
+
+
+def wants_vehlen(c, identity=False):
+    return identity or c["kind"] == "ident"
+
+
+def write_run(c, rundir, threads, vehlen=False):
     if os.path.isdir(rundir):
         shutil.rmtree(rundir)
     os.makedirs(rundir)
@@ -195,14 +281,18 @@ def write_run(c, rundir, threads):
     lines += ["<FILE PATH> ./", "<DATA PATH> ./",
               "<CONVERGENCE GAP> %g" % c["solve_gap"],
               "<MAX ITERATIONS> %d" % c["maxit"],
-              "<NUMBER OF THREADS> %d" % threads,
-              "<FLOWS FILE> flows.txt"] + c["extra"]
+              "<NUMBER OF THREADS> %d" % threads]
+    if vehlen:
+        lines.append("<ORIGIN VEH LENGTH FILE> %s" % VEHLEN)
+    # <FLOWS FILE> stays last before the extras: readParametersFile processes
+    # the file's last tag twice (IVES-FORK.md 18, F7), harmless for it.
+    lines += ["<FLOWS FILE> flows.txt"] + c["extra"]
     with open(os.path.join(rundir, "params.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
 
-def run(binary, c, rundir, threads):
-    write_run(c, rundir, threads)
+def run(binary, c, rundir, threads, vehlen=False):
+    write_run(c, rundir, threads, vehlen)
     t0 = time.time()
     with open(os.path.join(rundir, "log.txt"), "w") as log:
         rc = subprocess.call([binary, "params.txt"], cwd=rundir, stdout=log,
@@ -211,6 +301,47 @@ def run(binary, c, rundir, threads):
     log = open(os.path.join(rundir, "log.txt")).read()
     its = re.findall(r"Iteration (\d+):(?: est\.)? gap ([0-9.eE+-]+)", log)
     return rc, wall, log, (int(its[-1][0]), float(its[-1][1])) if its else None
+
+
+def log_extract(log):
+    """The log lines G-ID1 compares: CLASS_GAP, and Iteration with the time
+    and shift-count fields stripped (wall time varies; the shift count may
+    differ by design -- empty bushes no longer count their zero shifts)."""
+    out = []
+    for line in log.splitlines():
+        if line.startswith("Iteration "):
+            out.append(re.sub(r"time [0-9.]+, -?\d+ shifts", "", line))
+        elif line.startswith("CLASS_GAP"):
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def counter(log):
+    """(N, M) from the skip's counter line, or None if absent."""
+    m = COUNTER.search(log)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def check_counter(c, log):
+    """'' if the counter line printed the case's known empties, else why."""
+    got = counter(log)
+    if got is None:
+        return "no 'Empty origins skipped' line"
+    if got[0] != c["empties"]:
+        return "skip counter %d, expected %d" % (got[0], c["empties"])
+    return ""
+
+
+def cmp_files(a, b):
+    """Byte comparison via cmp(1); (identical?, cmp's output)."""
+    p = subprocess.run(["cmp", a, b], capture_output=True, text=True)
+    return p.returncode == 0, (p.stdout + p.stderr).strip()
+
+
+def ident_golden(c, what):
+    # the log extract is ".gaps": .gitignore ignores *.log
+    return os.path.join(GOLDEN, "ident", "%s.%s" % (
+        c["golden"], "gaps" if what == "log" else what))
 
 
 def md5(path):
@@ -248,14 +379,20 @@ def cmd_golden(a):
     os.makedirs(GOLDEN, exist_ok=True)
     sums = read_checksums()
     for c in selected(a):
-        if c["kind"] not in ("file", "md5") or c["class_toll"]:
+        if c["kind"] not in ("file", "md5", "ident") or c["class_toll"]:
             continue
         rd = os.path.join(a.work, "golden", c["name"])
-        rc, wall, log, last = run(a.bin, c, rd, 1)
+        rc, wall, log, last = run(a.bin, c, rd, 1, wants_vehlen(c))
         if rc != 0:
             sys.exit("%s: tap-b exited %d" % (c["name"], rc))
         fl = os.path.join(rd, "flows.txt")
-        if c["kind"] == "file":
+        if c["kind"] == "ident":
+            os.makedirs(os.path.join(GOLDEN, "ident"), exist_ok=True)
+            shutil.copyfile(fl, ident_golden(c, "flows"))
+            shutil.copyfile(os.path.join(rd, VEHLEN), ident_golden(c, "vehlen"))
+            with open(ident_golden(c, "log"), "w") as f:
+                f.write(log_extract(log))
+        elif c["kind"] == "file":
             shutil.copyfile(fl, os.path.join(GOLDEN, c["name"] + ".flows"))
         else:
             sums[c["name"]] = md5(fl)
@@ -274,7 +411,7 @@ def cmd_check(a):
     for c in selected(a):
         threads = 1 if c["kind"] != "oracle" else a.threads
         rd = os.path.join(a.work, "check-t%d" % threads, c["name"])
-        rc, wall, log, last = run(a.bin, c, rd, threads)
+        rc, wall, log, last = run(a.bin, c, rd, threads, wants_vehlen(c))
         fl = os.path.join(rd, "flows.txt")
         tag = "%-28s t=%-2d" % (c["name"], threads)
         if c["kind"] == "reject":
@@ -291,6 +428,12 @@ def cmd_check(a):
             fails += 1
             continue
         info = "iter %d gap %.3e %.1f s" % (last[0], last[1], wall)
+        why = check_counter(c, log)
+        if why:
+            print("FAIL %s %s  %s" % (tag, why, info))
+            fails += 1
+            continue
+        info += ", skipped %d" % c["empties"]
         if c["class_toll"] and "Class tolls loaded" not in log:
             print("FAIL %s class toll file given but not loaded  %s"
                   % (tag, info))
@@ -318,6 +461,21 @@ def cmd_check(a):
                 "link rows" if c["rows_only"] else "flows",
                 "==" if ok else "!=", r["name"],
                 "" if fired else " (class tolls NOT loaded)", info))
+            fails += not ok
+        elif c["kind"] == "ident":
+            res = []
+            for what, path in [("flows", fl),
+                               ("vehlen", os.path.join(rd, VEHLEN))]:
+                res.append((what,) + cmp_files(path, ident_golden(c, what)))
+            elog = os.path.join(rd, "log_extract.txt")
+            with open(elog, "w") as f:
+                f.write(log_extract(log))
+            res.append(("log",) + cmp_files(elog, ident_golden(c, "log")))
+            ok = all(r[1] for r in res)
+            print("%s %s %s  %s" % ("ok  " if ok else "FAIL", tag,
+                  ", ".join("%s %s" % (w, "==" if same else "!= (" + out + ")")
+                            for w, same, out in res) + " 81d8e14 golden",
+                  info))
             fails += not ok
         elif c["kind"] == "file":
             g = os.path.join(GOLDEN, c["golden"] + ".flows")
@@ -380,10 +538,68 @@ def cmd_check(a):
     return 1 if fails else 0
 
 
+def cmd_identity(a):
+    """G-ID1 against a live reference binary: every non-reject case at 1
+    thread, new and reference, `cmp` on flows, origin veh-length and the log
+    extract; the new binary's counter line must print the case's empties."""
+    fails = 0
+    for c in selected(a):
+        if c["kind"] == "reject":
+            continue
+        if a.solve_gap:
+            # A looser solve for the large cases at 1 thread: the trajectory
+            # is compared step for step, so identity is as sharp per
+            # iteration; only fewer iterations are covered.
+            c = dict(c, solve_gap=a.solve_gap)
+        out = {}
+        for who, b in (("new", a.bin), ("ref", a.ref_bin)):
+            rd = os.path.join(a.work, "identity", who, c["name"])
+            rc, wall, log, last = run(b, c, rd, 1, vehlen=True)
+            elog = os.path.join(rd, "log_extract.txt")
+            with open(elog, "w") as f:
+                f.write(log_extract(log))
+            out[who] = (rd, rc, log, last)
+        tag = "%-28s" % c["name"]
+        if out["new"][1] != 0 or out["ref"][1] != 0:
+            print("FAIL %s exit new %d ref %d" % (tag, out["new"][1],
+                                                  out["ref"][1]))
+            fails += 1
+            continue
+        lines = []
+        ok = True
+        why = check_counter(c, out["new"][2])
+        if why:
+            ok = False
+            lines.append("counter: " + why)
+        else:
+            m = COUNTER.search(out["new"][2])
+            lines.append("counter: " + out["new"][2][m.start():].splitlines()[0])
+        for what in ("flows.txt", VEHLEN, "log_extract.txt"):
+            pa = os.path.join(out["new"][0], what)
+            pb = os.path.join(out["ref"][0], what)
+            same, txt = cmp_files(pa, pb)
+            ok = ok and same
+            lines.append("cmp %s: %s" % (what, "identical (%d bytes)"
+                         % os.path.getsize(pa) if same else txt))
+        if out["new"][3] != out["ref"][3]:
+            ok = False
+        lines.append("iterations new %s ref %s" % (out["new"][3][0],
+                                                   out["ref"][3][0]))
+        print("%s %s %s" % ("ok  " if ok else "FAIL", tag, lines[0]))
+        for l in lines[1:]:
+            print("     " + l)
+        fails += not ok
+    print("%d failure(s)" % fails)
+    return 1 if fails else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["check", "golden", "list"])
+    ap.add_argument("mode", choices=["check", "golden", "identity", "list"])
     ap.add_argument("--bin", default=os.path.join(ROOT, "bin", "tap"))
+    ap.add_argument("--ref-bin", help="identity: the reference binary")
+    ap.add_argument("--solve-gap", type=float,
+                    help="identity: override every selected case's solve gap")
     ap.add_argument("--serial-bin")
     ap.add_argument("--threads", type=int, default=1,
                     help="threads for the multi-class cases (single-class "
@@ -394,6 +610,11 @@ def main():
     ap.add_argument("--work", default=os.path.join(ROOT, "scratch", "check"))
     a = ap.parse_args()
     a.bin = os.path.abspath(a.bin)
+    if a.mode == "identity":
+        if not a.ref_bin:
+            sys.exit("identity needs --ref-bin")
+        a.ref_bin = os.path.abspath(a.ref_bin)
+        return cmd_identity(a)
     if a.serial_bin:
         a.serial_bin = os.path.abspath(a.serial_bin)
     if a.mode == "list":

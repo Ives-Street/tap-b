@@ -302,7 +302,102 @@ network_type *readParametersFile(algorithmBParameters_type *thisRun,
     free(tripsFiles);
     setBatches(network, network->numOrigins / numBatches, thisRun->warmStart,
                thisRun->storeMatrices, thisRun->matrixStem);
+    setActiveOrigins(network, thisRun); /* IVES FORK, IVES-FORK.md 18 */
     return network;
+}
+
+/*
+ * IVES FORK: setActiveOrigins -- the active-origin set (IVES-FORK.md 18).
+ *
+ * An (origin, class) pair whose trips row sums to exactly 0 carries no demand,
+ * so its bush carries no flow: every contribution it makes to a link flow, to
+ * TSTT or to SPTT is += 0.0.  It is marked inactive and gets no bush.  The
+ * row sum is exactly 0 only when every entry is 0 (readOBANetwork refuses
+ * negative demand and a negative multiplier), and an origin whose only demand
+ * is intrazonal counts as active.
+ *
+ * The one effect an empty bush had in 81d8e14 is the class-cost switch its
+ * dispatch triggered (changeFixedCosts updates costs incrementally, so the
+ * switch sequence moves costs by an ulp).  The dispatchers keep it: an
+ * inactive origin is a task that does no work and returns TRUE.  That
+ * emulation is exact only where an empty bush's real task provably does
+ * nothing else, so the skip is engaged only when
+ *   - there is one batch (several batches keep the rows on disk and in
+ *     bushTSTT; connectome always writes one);
+ *   - <LINK COST UPDATE> is EXACT (otherwise every bush scan, empty ones
+ *     included, recomputes every link cost);
+ *   - <THRESHOLD GAP> <= 0 (otherwise rescanAndCheck can retire an empty
+ *     bush, which then stops triggering its switch);
+ *   - <MIN LINK FLOW> >= 0 (otherwise an empty bush's zero approach flows
+ *     count as used, and a zero Newton shift recomputes link costs).
+ * Every default qualifies.  With the skip off every origin is active and the
+ * solve is 81d8e14's.
+ */
+void setActiveOrigins(network_type *network,
+                      algorithmBParameters_type *parameters) {
+    int r, j, c;
+    double rowSum;
+    const char *off = NULL;
+    char reason[STRING_SIZE];
+
+    network->isActive = newVector(network->numOrigins, bool);
+    network->activeOrigins = newVector(network->numOrigins, int);
+    network->classHasEmpty = newVector(network->numClasses, bool);
+    declareVector(int, classEmpty, network->numClasses);
+    for (c = 0; c < network->numClasses; c++) {
+        network->classHasEmpty[c] = FALSE;
+        classEmpty[c] = 0;
+    }
+
+    if (network->numBatches > 1) {
+        snprintf(reason, sizeof(reason), "%d batches", network->numBatches);
+        off = reason;
+    } else if (parameters->linkShiftB != &exactCostUpdate) {
+        off = "<LINK COST UPDATE> is not EXACT";
+    } else if (parameters->thresholdGap > 0) {
+        off = "<THRESHOLD GAP> > 0";
+    } else if (!(parameters->minLinkFlow >= 0)) {
+        off = "<MIN LINK FLOW> < 0";
+    } else if (parameters->warmStart == TRUE
+               || parameters->storeBushes == TRUE) {
+        off = "bush file I/O not yet subset-aware";
+    }
+    network->skipEmpty = (off == NULL) ? TRUE : FALSE;
+
+    network->numActive = 0;
+    for (r = 0; r < network->numOrigins; r++) {
+        network->isActive[r] = TRUE;
+        if (network->skipEmpty == TRUE) {
+            rowSum = 0;
+            for (j = 0; j < network->numZones; j++)
+                rowSum += network->demand[r][j];
+            if (rowSum == 0) {
+                network->isActive[r] = FALSE;
+                c = r / network->numZones; /* one batch: origin2class */
+                network->classHasEmpty[c] = TRUE;
+                classEmpty[c]++;
+                continue;
+            }
+        }
+        network->activeOrigins[network->numActive++] = r;
+    }
+
+    if (network->skipEmpty == FALSE) {
+        displayMessage(LOW_NOTIFICATIONS, "Empty origins skipped: 0 of %d "
+                       "(skip off: %s)\n", network->numOrigins, off);
+    } else {
+        char perClass[STRING_SIZE];
+        int len = 0;
+        perClass[0] = '\0';
+        for (c = 0; c < network->numClasses && len < STRING_SIZE - 16; c++)
+            len += snprintf(perClass + len, STRING_SIZE - len, "%s%d",
+                            c == 0 ? "" : ", ", classEmpty[c]);
+        displayMessage(LOW_NOTIFICATIONS, "Empty origins skipped: %d of %d "
+                       "(per class: %s)\n",
+                       network->numOrigins - network->numActive,
+                       network->numOrigins, perClass);
+    }
+    deleteVector(classEmpty);
 }
 
 /*

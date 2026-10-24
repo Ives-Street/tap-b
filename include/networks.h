@@ -163,6 +163,18 @@ typedef struct {
     int batchSize; /* Indicates number of batches per origin */
     int numBatches;
     int curBatch; /* Indicates which origin batch is current */
+    /* IVES FORK: the active-origin set (IVES-FORK.md 18).  An (origin, class)
+     * pair whose trips row sums to exactly 0 is *inactive*: it gets no bush
+     * and no work, only the class-cost switch 81d8e14 made when it dispatched
+     * that empty bush.  Built once by setActiveOrigins, after the trips are
+     * read and the batches are set.  With the skip off (several batches, or a
+     * parameter outside the exactness argument) every origin is active and
+     * nothing below changes behaviour. */
+    bool skipEmpty;      /* TRUE iff the skip is engaged */
+    int  numActive;      /* number of active origins */
+    int  *activeOrigins; /* [numActive] active origin indices, ascending */
+    bool *isActive;      /* [origin] */
+    bool *classHasEmpty; /* [class] TRUE iff some origin of the class is inactive */
 #ifdef PARALLELISM
     pthread_mutex_t* arc_muts;
 #endif

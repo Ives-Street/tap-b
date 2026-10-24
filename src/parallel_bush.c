@@ -621,6 +621,7 @@ void checkFlows_par(network_type *network, bushes_type *bushes, int t_id) {
     }
 
     for (r = 0; r < network->numZones; r++) {
+        if (network->isActive[r] == FALSE) continue; /* IVES FORK 18 */
         calculateBushFlows_par(r, network, bushes);
         /* First check bush flow consistency */
         for (ij = 0; ij < network->numArcs; ij++) {

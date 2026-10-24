@@ -49,6 +49,9 @@ void readPreloadFile(network_type *network, char *preloadFileName);
 void readClassTollFile(network_type *network, char *classTollFileName);
 void setBatches(network_type *network, int batchSize, bool warmStart,
                 bool storeMatrices, char *matrixStem);
+/* IVES FORK: the active-origin set, after setBatches (IVES-FORK.md 18) */
+void setActiveOrigins(network_type *network,
+                      algorithmBParameters_type *parameters);
 void writeOBANetwork(network_type *Network, char *linkfile, char *tripfile);
 void writeNetworkFlows(network_type *network, char *outputFileName);
 void writeMulticlassFlows(network_type *network, char *outputFileName);

@@ -40,6 +40,29 @@ Fixtures (IVES-FORK.md sections 14-15):
                                 cols (row 30 with 3 toll columns), classes
                                 (<NUMBER OF CLASSES> 3), nan (a non-finite toll)
 
+  Empty-origin fixtures (IVES-FORK.md 18), over the tolled SiouxFalls network;
+  each origin block is the stock one or absent, demand is never rescaled
+    SiouxFalls_dj2_a.txt        origins 1-12, plus origin 13 with intrazonal
+                                demand only (13 : 100 -- active, not empty),
+                                <TOLL FACTOR> 0.5
+    SiouxFalls_dj2_b.txt        origins 13-24, <TOLL FACTOR> 4.0
+    SiouxFalls_dj3_0/1/2.txt    origin o in class (o - 1) mod 3, interleaved,
+                                <TOLL FACTOR> 0.5 / 4.0 / 0.0
+    SiouxFalls_empty_lo/hi.txt  no demand at all, <TOLL FACTOR> 0.5 / 4.0
+    SiouxFalls_warm_add.txt     stock trips with origin 7 removed (the warm
+                                base) -- and SiouxFalls_warm_full.txt, stock
+                                trips: adding origin 7's demand back
+    SiouxFalls_warm_drop.txt    stock trips with origins 7 and 11 removed:
+                                zeroing a non-empty origin of warm_add
+    SiouxFalls_warm_hi_add.txt  origins 12-24 at <TOLL FACTOR> 4.0: dj2_b
+                                with origin 12 added
+    (the other warm_* at <TOLL FACTOR> 0.5; the warm cases pair them with
+    dj2_b / warm_hi_add as a second class)
+
+  ChicagoRegional disjoint classes (memory measurement, IVES-FORK.md 18)
+    ChicagoRegional_dj3_0/1/2.txt  origin o in class (o - 1) mod 3, stock
+                                   demand unscaled, toll factor 2 / 10 / 0
+
 Usage: make_fixtures.py [--net NETDIR] [--out OUTDIR] [--no-chicago]
 """
 import argparse
@@ -196,6 +219,70 @@ def class_tolls(netdir, out):
         g.write("\n".join(na) + "\n")
 
 
+def origin_blocks(text):
+    """Split a TNTP trips file into (metadata head, {origin: block text}),
+    each block running from its "Origin" line to the next."""
+    head, sep, body = text.partition("<END OF METADATA>\n")
+    assert sep
+    blocks, cur = {}, None
+    for line in body.split("\n"):
+        m = re.match(r"\s*Origin\s+(\d+)", line)
+        if m:
+            cur = int(m.group(1))
+            blocks[cur] = [line]
+        elif cur is not None:
+            blocks[cur].append(line)
+    return head, {o: "\n".join(b).rstrip() + "\n\n" for o, b in blocks.items()}
+
+
+def block_total(block):
+    return sum(float(m.group(3)) for m in _NUM.finditer(block.split("\n", 1)[1]))
+
+
+def write_trips(path, nzones, toll_factor, blocks, origins, extra=""):
+    """origins: the origin blocks kept, in ascending order.  extra: raw
+    blocks appended after them (still in ascending origin order overall is
+    not required by tap-b; the reader indexes by the Origin line)."""
+    kept = [blocks[o] for o in sorted(origins)]
+    total = sum(block_total(b) for b in kept) + (block_total(extra)
+                                                 if extra else 0)
+    with open(path, "w") as g:
+        g.write("<NUMBER OF ZONES> %d\n<TOTAL OD FLOW> %r\n"
+                "<TOLL FACTOR> %s\n<END OF METADATA>\n\n\n"
+                % (nzones, total, toll_factor))
+        g.write("".join(kept) + extra)
+
+
+def empty_origin_fixtures(netdir, out):
+    _, blocks = origin_blocks(read_text(os.path.join(netdir,
+                                                     "SiouxFalls_trips.txt")))
+    assert sorted(blocks) == list(range(1, 25))
+    sf = lambda name: os.path.join(out, "SiouxFalls_%s.txt" % name)
+    intrazonal13 = "Origin \t13 \n   13 :    100.0; \n\n"
+    write_trips(sf("dj2_a"), 24, "0.5", blocks, range(1, 13),
+                extra=intrazonal13)
+    write_trips(sf("dj2_b"), 24, "4.0", blocks, range(13, 25))
+    for k, tf in enumerate(["0.5", "4.0", "0.0"]):
+        write_trips(sf("dj3_%d" % k), 24, tf, blocks,
+                    [o for o in range(1, 25) if (o - 1) % 3 == k])
+    write_trips(sf("empty_lo"), 24, "0.5", blocks, [])
+    write_trips(sf("empty_hi"), 24, "4.0", blocks, [])
+    write_trips(sf("warm_full"), 24, "0.5", blocks, range(1, 25))
+    write_trips(sf("warm_add"), 24, "0.5", blocks,
+                [o for o in range(1, 25) if o != 7])
+    write_trips(sf("warm_drop"), 24, "0.5", blocks,
+                [o for o in range(1, 25) if o not in (7, 11)])
+    write_trips(sf("warm_hi_add"), 24, "4.0", blocks, range(12, 25))
+
+
+def chicago_disjoint(netdir, out):
+    _, blocks = origin_blocks(read_text(os.path.join(
+        netdir, "ChicagoRegional_trips.txt")))
+    for k, tf in enumerate(["2", "10", "0"]):
+        write_trips(os.path.join(out, "ChicagoRegional_dj3_%d.txt" % k), 1790,
+                    tf, blocks, [o for o in blocks if (o - 1) % 3 == k])
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
@@ -208,8 +295,10 @@ def main():
     class_tolls(a.net, a.out)
     for net in PRELOAD_NETS:
         preload(a.net, a.out, net)
+    empty_origin_fixtures(a.net, a.out)
     if not a.no_chicago:
         chicago_splits(a.net, a.out)
+        chicago_disjoint(a.net, a.out)
     return 0
 
 
