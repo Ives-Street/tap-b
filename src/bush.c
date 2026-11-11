@@ -339,6 +339,7 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
 
     /* Allocate memory for bushes */
     int batch, iteration = 0, lastClass = IS_MISSING;
+    int shiftsBefore; /* IVES FORK: AEC deadlock guard */
     displayMessage(FULL_NOTIFICATIONS, "Creating initial bushes\n");
     bushes_type *bushes = createBushes(network);
     struct timespec tick, tock;
@@ -392,8 +393,34 @@ void AlgorithmB(network_type *network, algorithmBParameters_type *parameters) {
         for (batch = 0; batch < network->numBatches; batch++) {
             /* Do main work for this batch */
             loadBatch(batch, network, &bushes, parameters);
+            shiftsBefore = parameters->numFlowShifts;
             updateBatchBushes(network, bushes, &lastClass, parameters);
             updateBatchFlows(network, bushes, &lastClass, parameters);
+            /* IVES FORK: AEC deadlock guard (IVES-FORK.md 19).  thresholdAEC
+             * is set to 0.25 x the last iteration's gap (end of this loop),
+             * but rescanAndCheck compares it with each bush's excess over its
+             * *bush-internal* shortest path, which is never larger than its
+             * share of the network gap and can be far smaller.  After a bad
+             * first iteration (DC: gap ~3,000) the threshold exceeds every
+             * bush's, no bush shifts any flow, the gap does not move, and the
+             * threshold stays put: a permanent no-op.  If a batch shifted
+             * nothing at a positive threshold, drop the threshold to 0 for
+             * the rest of this iteration and redo the flow updates.  A batch
+             * that shifts anything is untouched, so normal runs are
+             * bit-identical. */
+            if (parameters->numFlowShifts == shiftsBefore
+                    && parameters->thresholdAEC > 0) {
+                displayMessage(LOW_NOTIFICATIONS, "AEC guard: iteration %d "
+                               "batch %d shifted no flow at threshold AEC "
+                               "%g; redoing its flow updates at 0\n",
+                               iteration, batch, parameters->thresholdAEC);
+                parameters->thresholdAEC = 0;
+                for (int j = 0; j < network->batchSize; j++) {
+                    if (outOfOrigins(network, j) == TRUE) break;
+                    bushes->updateBush[j] = TRUE;
+                }
+                updateBatchFlows(network, bushes, &lastClass, parameters);
+            }
             /* IVES FORK: with a single batch nothing reads the stored bushes
              * back within the run (loadBatch skips the read), so a
              * <STORE BUSHES> run only needs the final state -- written once

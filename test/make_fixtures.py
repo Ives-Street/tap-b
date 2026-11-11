@@ -59,6 +59,12 @@ Fixtures (IVES-FORK.md sections 14-15):
     (the other warm_* at <TOLL FACTOR> 0.5; the warm cases pair them with
     dj2_b / warm_hi_add as a second class)
 
+  AEC deadlock (IVES-FORK.md 19)
+    SiouxFalls_aectrap_net.txt  stock net with the capacity of the 7 links
+                                AEC_TRAP_SF / 20: the first iteration leaves
+                                the gap at ~127, and 808be7d then shifts no
+                                flow ever again
+
   ChicagoRegional disjoint classes (memory measurement, IVES-FORK.md 18)
     ChicagoRegional_dj3_0/1/2.txt  origin o in class (o - 1) mod 3, stock
                                    demand unscaled, toll factor 2 / 10 / 0
@@ -83,6 +89,12 @@ PRELOAD_SHARE = 0.10
 # Class-toll exemption: class 2 pays nothing on the tolled links incident to
 # this node.
 CT_EXEMPT_NODE = "16"
+# AEC deadlock fixture: (init, term) of the links whose capacity is cut 20x,
+# found by a seeded search over capacity-cut SiouxFalls variants for one where
+# 808be7d's shift count freezes after iteration 1.
+AEC_TRAP_SF = [("16", "8"), ("16", "10"), ("17", "10"), ("17", "16"),
+               ("18", "7"), ("22", "21"), ("22", "23")]
+AEC_TRAP_CUT = 20
 
 
 def read_text(path):
@@ -126,6 +138,22 @@ def tolled_siouxfalls(netdir, out):
         assert t != trips
         with open(os.path.join(out, "SiouxFalls_k_%s.txt" % tag), "w") as g:
             g.write(t)
+
+
+def aec_trap_siouxfalls(netdir, out):
+    lines = read_text(os.path.join(netdir, "SiouxFalls_net.txt")).split("\n")
+    cut = 0
+    for k in link_rows(lines):
+        f = lines[k].split("\t")
+        # leading tab, then init term cap length fft B power speed toll type ;
+        assert f[0] == "" and len(f) >= 11, lines[k]
+        if (f[1], f[2]) in AEC_TRAP_SF:
+            f[3] = str(float(f[3]) / AEC_TRAP_CUT)
+            cut += 1
+        lines[k] = "\t".join(f)
+    assert cut == len(AEC_TRAP_SF), cut
+    with open(os.path.join(out, "SiouxFalls_aectrap_net.txt"), "w") as g:
+        g.write("\n".join(lines))
 
 
 _NUM = re.compile(r"(\d+)(\s*:\s*)([0-9.eE+-]+)")
@@ -296,6 +324,7 @@ def main():
     for net in PRELOAD_NETS:
         preload(a.net, a.out, net)
     empty_origin_fixtures(a.net, a.out)
+    aec_trap_siouxfalls(a.net, a.out)
     if not a.no_chicago:
         chicago_splits(a.net, a.out)
         chicago_disjoint(a.net, a.out)
